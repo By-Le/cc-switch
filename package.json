@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "pnpm tauri dev",
     "build": "pnpm tauri build",
+    "build:windows": "pnpm tauri build --bundles msi --ci",
     "tauri": "tauri",
     "dev:renderer": "vite",
     "build:renderer": "vite build",

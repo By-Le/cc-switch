@@ -223,7 +223,7 @@ jobs:
 
       - name: Build Tauri App (Windows)
         if: runner.os == 'Windows'
-        run: pnpm tauri build
+        run: pnpm build:windows
 
       - name: Build Tauri App (Linux)
         if: runner.os == 'Linux'
@@ -404,20 +404,19 @@ jobs:
             # 兜底：全局搜索 .msi
             $msi = Get-ChildItem -Path 'src-tauri/target/release/bundle' -Recurse -Include *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
           }
-          if ($null -ne $msi) {
-            $dest = "CC-Switch-$VERSION-Windows.msi"
-            Copy-Item $msi.FullName (Join-Path release-assets $dest)
-            Write-Host "Installer copied: $dest"
-            $sigPath = "$($msi.FullName).sig"
-            if (Test-Path $sigPath) {
-              Copy-Item $sigPath (Join-Path release-assets ("$dest.sig"))
-              Write-Host "Signature copied: $dest.sig"
-            } else {
-              Write-Warning "Signature not found for $($msi.Name)"
-            }
-          } else {
-            Write-Warning 'No Windows MSI installer found'
+          if ($null -eq $msi) {
+            throw 'No Windows MSI installer found'
           }
+
+          $dest = "CC-Switch-$VERSION-Windows.msi"
+          Copy-Item $msi.FullName (Join-Path release-assets $dest)
+          Write-Host "Installer copied: $dest"
+          $sigPath = "$($msi.FullName).sig"
+          if (-not (Test-Path $sigPath)) {
+            throw "Signature not found for $($msi.Name)"
+          }
+          Copy-Item $sigPath (Join-Path release-assets ("$dest.sig"))
+          Write-Host "Signature copied: $dest.sig"
           # 绿色版（portable）：仅可执行文件打 zip（不参与 Updater）
           $exeCandidates = @(
             'src-tauri/target/release/cc-switch.exe',
