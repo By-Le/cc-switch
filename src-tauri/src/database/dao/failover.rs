@@ -6,6 +6,7 @@ use crate::database::{lock_conn, Database};
 use crate::error::AppError;
 use crate::provider::{Provider, ProviderLoadLimits};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// 故障转移队列条目（简化版，用于前端展示）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +100,79 @@ impl Database {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         log::info!("已从故障转移队列移除供应商 {provider_id} ({app_type}), 并清除其健康状态");
+
+        Ok(())
+    }
+
+    /// 重排故障转移队列。
+    ///
+    /// 队列顺序复用 providers.sort_index；调用方必须传入当前队列的完整 provider_id 列表。
+    pub fn reorder_failover_queue(
+        &self,
+        app_type: &str,
+        provider_ids: &[String],
+    ) -> Result<(), AppError> {
+        let mut conn = lock_conn!(self.conn);
+
+        if provider_ids.is_empty() {
+            return Err(AppError::InvalidInput(
+                "故障转移队列排序不能为空".to_string(),
+            ));
+        }
+
+        let requested_ids: HashSet<&str> = provider_ids.iter().map(String::as_str).collect();
+        if requested_ids.len() != provider_ids.len() {
+            return Err(AppError::InvalidInput(
+                "故障转移队列排序包含重复供应商".to_string(),
+            ));
+        }
+
+        let current_ids = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id
+                     FROM providers
+                     WHERE app_type = ?1 AND in_failover_queue = 1",
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+            let rows = stmt
+                .query_map([app_type], |row| row.get::<_, String>(0))
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            rows
+        };
+
+        let current_ids_set: HashSet<&str> = current_ids.iter().map(String::as_str).collect();
+        if current_ids_set != requested_ids {
+            return Err(AppError::InvalidInput(
+                "故障转移队列已变化，请刷新后重试".to_string(),
+            ));
+        }
+
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        for (index, provider_id) in provider_ids.iter().enumerate() {
+            let updated = tx
+                .execute(
+                    "UPDATE providers
+                     SET sort_index = ?1
+                     WHERE id = ?2 AND app_type = ?3 AND in_failover_queue = 1",
+                    rusqlite::params![index, provider_id, app_type],
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+            if updated != 1 {
+                return Err(AppError::InvalidInput(format!(
+                    "供应商 {provider_id} 不在故障转移队列中"
+                )));
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(())
     }

@@ -663,6 +663,67 @@ fn failover_queue_items_include_load_limits() {
 }
 
 #[test]
+fn reorder_failover_queue_updates_queue_priority() {
+    let db = Database::memory().expect("create memory db");
+
+    for (index, id) in ["alpha", "beta", "gamma"].iter().enumerate() {
+        let mut provider = Provider::with_id(
+            (*id).to_string(),
+            format!("Provider {id}"),
+            json!({}),
+            None,
+        );
+        provider.sort_index = Some(index);
+        db.save_provider("claude", &provider).expect("save provider");
+        db.add_to_failover_queue("claude", id)
+            .expect("add provider to queue");
+    }
+
+    db.reorder_failover_queue(
+        "claude",
+        &["gamma".to_string(), "alpha".to_string(), "beta".to_string()],
+    )
+    .expect("reorder queue");
+
+    let queue = db.get_failover_queue("claude").expect("get queue");
+    let ordered_ids: Vec<_> = queue.iter().map(|item| item.provider_id.as_str()).collect();
+
+    assert_eq!(ordered_ids, vec!["gamma", "alpha", "beta"]);
+    assert_eq!(queue[0].sort_index, Some(0));
+    assert_eq!(queue[1].sort_index, Some(1));
+    assert_eq!(queue[2].sort_index, Some(2));
+}
+
+#[test]
+fn reorder_failover_queue_rejects_stale_or_duplicate_ids() {
+    let db = Database::memory().expect("create memory db");
+
+    for (index, id) in ["alpha", "beta"].iter().enumerate() {
+        let mut provider = Provider::with_id(
+            (*id).to_string(),
+            format!("Provider {id}"),
+            json!({}),
+            None,
+        );
+        provider.sort_index = Some(index);
+        db.save_provider("claude", &provider).expect("save provider");
+        db.add_to_failover_queue("claude", id)
+            .expect("add provider to queue");
+    }
+
+    let missing = db.reorder_failover_queue("claude", &["alpha".to_string()]);
+    assert!(missing.is_err());
+
+    let duplicate =
+        db.reorder_failover_queue("claude", &["alpha".to_string(), "alpha".to_string()]);
+    assert!(duplicate.is_err());
+
+    let queue = db.get_failover_queue("claude").expect("get queue");
+    let ordered_ids: Vec<_> = queue.iter().map(|item| item.provider_id.as_str()).collect();
+    assert_eq!(ordered_ids, vec!["alpha", "beta"]);
+}
+
+#[test]
 fn schema_model_pricing_is_seeded_on_init() {
     let db = Database::memory().expect("create memory db");
 

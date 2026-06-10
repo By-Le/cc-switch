@@ -3,6 +3,7 @@ import { failoverApi } from "@/lib/api/failover";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import type { FailoverQueueItem } from "@/types/proxy";
 
 // ========== 熔断器 Hooks ==========
 
@@ -182,6 +183,67 @@ export function useRemoveFromFailoverQueue() {
           variables.providerId,
           variables.appType,
         ],
+      });
+    },
+  });
+}
+
+/**
+ * 重排故障转移队列
+ */
+export function useReorderFailoverQueue() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      appType,
+      providerIds,
+    }: {
+      appType: string;
+      providerIds: string[];
+    }) => failoverApi.reorderFailoverQueue(appType, providerIds),
+    onMutate: async ({ appType, providerIds }) => {
+      const queryKey = ["failoverQueue", appType];
+      await queryClient.cancelQueries({ queryKey });
+      const previousQueue =
+        queryClient.getQueryData<FailoverQueueItem[]>(queryKey);
+
+      if (previousQueue) {
+        const byId = new Map(
+          previousQueue.map((item) => [item.providerId, item]),
+        );
+        const reordered: FailoverQueueItem[] = [];
+        providerIds.forEach((providerId, index) => {
+          const item = byId.get(providerId);
+          if (item) {
+            reordered.push({ ...item, sortIndex: index });
+          }
+        });
+
+        if (reordered.length === previousQueue.length) {
+          queryClient.setQueryData(queryKey, reordered);
+        }
+      }
+
+      return { previousQueue, appType };
+    },
+    onError: (_error, _variables, context) => {
+      if (context?.previousQueue) {
+        queryClient.setQueryData(
+          ["failoverQueue", context.appType],
+          context.previousQueue,
+        );
+      }
+    },
+    onSettled: (_data, _error, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["failoverQueue", variables.appType],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["providers", variables.appType],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["proxyStatus"],
       });
     },
   });

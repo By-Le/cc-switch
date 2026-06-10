@@ -3,13 +3,39 @@
  *
  * 允许用户管理代理模式下的故障转移与负载分流队列，支持：
  * - 添加/移除供应商
- * - 队列顺序基于首页供应商列表的 sort_index
+ * - 拖拽或按钮调整队列优先级
  */
 
-import { useState } from "react";
+import { type CSSProperties, useCallback, useState } from "react";
+import {
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  arrayMove,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
-import { Plus, Trash2, Loader2, Info, AlertTriangle } from "lucide-react";
+import {
+  Plus,
+  Trash2,
+  Loader2,
+  Info,
+  AlertTriangle,
+  GripVertical,
+  ChevronUp,
+  ChevronDown,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -29,6 +55,7 @@ import {
   useAvailableProvidersForFailover,
   useAddToFailoverQueue,
   useRemoveFromFailoverQueue,
+  useReorderFailoverQueue,
   useAutoFailoverEnabled,
   useSetAutoFailoverEnabled,
 } from "@/lib/query/failover";
@@ -61,6 +88,65 @@ export function FailoverQueueManager({
   // Mutations
   const addToQueue = useAddToFailoverQueue();
   const removeFromQueue = useRemoveFromFailoverQueue();
+  const reorderQueue = useReorderFailoverQueue();
+  const isQueueActionPending =
+    addToQueue.isPending || removeFromQueue.isPending || reorderQueue.isPending;
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 8 },
+    }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+
+  const persistQueueOrder = useCallback(
+    async (nextQueue: FailoverQueueItem[]) => {
+      await reorderQueue.mutateAsync({
+        appType,
+        providerIds: nextQueue.map((item) => item.providerId),
+      });
+    },
+    [appType, reorderQueue],
+  );
+
+  const handleDragEnd = useCallback(
+    async (event: DragEndEvent) => {
+      const { active, over } = event;
+      if (!queue || !over || active.id === over.id) {
+        return;
+      }
+
+      const oldIndex = queue.findIndex(
+        (item) => item.providerId === String(active.id),
+      );
+      const newIndex = queue.findIndex(
+        (item) => item.providerId === String(over.id),
+      );
+      if (oldIndex === -1 || newIndex === -1) {
+        return;
+      }
+
+      try {
+        await persistQueueOrder(arrayMove(queue, oldIndex, newIndex));
+        toast.success(
+          t("proxy.failoverQueue.reorderSuccess", {
+            defaultValue: "队列顺序已更新",
+          }),
+          { closeButton: true },
+        );
+      } catch (error) {
+        toast.error(
+          t("proxy.failoverQueue.reorderFailed", {
+            defaultValue: "排序更新失败",
+          }) +
+            ": " +
+            String(error),
+        );
+      }
+    },
+    [persistQueueOrder, queue, t],
+  );
 
   // 切换故障转移开关
   const handleToggleFailover = (enabled: boolean) => {
@@ -99,6 +185,30 @@ export function FailoverQueueManager({
     } catch (error) {
       toast.error(
         t("proxy.failoverQueue.removeFailed", "移除失败") +
+          ": " +
+          String(error),
+      );
+    }
+  };
+
+  const handleMoveProvider = async (fromIndex: number, toIndex: number) => {
+    if (!queue || toIndex < 0 || toIndex >= queue.length) {
+      return;
+    }
+
+    try {
+      await persistQueueOrder(arrayMove(queue, fromIndex, toIndex));
+      toast.success(
+        t("proxy.failoverQueue.reorderSuccess", {
+          defaultValue: "队列顺序已更新",
+        }),
+        { closeButton: true },
+      );
+    } catch (error) {
+      toast.error(
+        t("proxy.failoverQueue.reorderFailed", {
+          defaultValue: "排序更新失败",
+        }) +
           ": " +
           String(error),
       );
@@ -225,18 +335,33 @@ export function FailoverQueueManager({
           </p>
         </div>
       ) : (
-        <div className="space-y-2">
-          {queue.map((item, index) => (
-            <QueueItem
-              key={item.providerId}
-              item={item}
-              index={index}
-              disabled={disabled}
-              onRemove={handleRemoveProvider}
-              isRemoving={removeFromQueue.isPending}
-            />
-          ))}
-        </div>
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={handleDragEnd}
+        >
+          <SortableContext
+            items={queue.map((item) => item.providerId)}
+            strategy={verticalListSortingStrategy}
+          >
+            <div className="space-y-2">
+              {queue.map((item, index) => (
+                <QueueItem
+                  key={item.providerId}
+                  item={item}
+                  index={index}
+                  disabled={disabled || isQueueActionPending}
+                  canMoveUp={index > 0}
+                  canMoveDown={index < queue.length - 1}
+                  onMove={handleMoveProvider}
+                  onRemove={handleRemoveProvider}
+                  isRemoving={removeFromQueue.isPending}
+                  isReordering={reorderQueue.isPending}
+                />
+              ))}
+            </div>
+          </SortableContext>
+        </DndContext>
       )}
 
       {/* 队列说明 */}
@@ -244,7 +369,7 @@ export function FailoverQueueManager({
         <p className="text-xs text-muted-foreground">
           {t(
             "proxy.failoverQueue.orderHint",
-            "主界面单选配置是正常的；队列才是多 Provider 分流入口。未配置负载限制时按首页供应商顺序尝试，配置后按实时负载选择。",
+            "主界面单选配置是正常的；队列才是多 Provider 分流入口。拖动手柄或点击上/下按钮可调整优先级，未配置负载限制时按队列顺序尝试。",
           )}
         </p>
       )}
@@ -256,26 +381,63 @@ interface QueueItemProps {
   item: FailoverQueueItem;
   index: number;
   disabled: boolean;
+  canMoveUp: boolean;
+  canMoveDown: boolean;
+  onMove: (fromIndex: number, toIndex: number) => void;
   onRemove: (providerId: string) => void;
   isRemoving: boolean;
+  isReordering: boolean;
 }
 
 function QueueItem({
   item,
   index,
   disabled,
+  canMoveUp,
+  canMoveDown,
+  onMove,
   onRemove,
   isRemoving,
+  isReordering,
 }: QueueItemProps) {
   const { t } = useTranslation();
   const loadLimitBadges = getLoadLimitBadges(item, t);
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: item.providerId, disabled });
+  const style: CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
 
   return (
     <div
+      ref={setNodeRef}
+      style={style}
       className={cn(
         "flex items-center gap-3 rounded-lg border bg-card p-3 transition-colors",
+        isDragging && "relative z-10 border-primary/50 bg-background shadow-lg",
       )}
     >
+      <Button
+        variant="ghost"
+        size="icon"
+        className="h-8 w-8 cursor-grab touch-none text-muted-foreground active:cursor-grabbing"
+        disabled={disabled}
+        aria-label={t("proxy.failoverQueue.dragHandle", {
+          defaultValue: "拖动调整顺序",
+        })}
+        {...attributes}
+        {...listeners}
+      >
+        <GripVertical className="h-4 w-4" />
+      </Button>
+
       {/* 序号 */}
       <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-xs font-medium">
         {index + 1}
@@ -304,21 +466,54 @@ function QueueItem({
         </div>
       </div>
 
-      {/* 删除按钮 */}
-      <Button
-        variant="ghost"
-        size="icon"
-        className="h-8 w-8 text-muted-foreground hover:text-destructive"
-        onClick={() => onRemove(item.providerId)}
-        disabled={disabled || isRemoving}
-        aria-label={t("common.delete", "删除")}
-      >
-        {isRemoving ? (
-          <Loader2 className="h-4 w-4 animate-spin" />
-        ) : (
-          <Trash2 className="h-4 w-4" />
-        )}
-      </Button>
+      <div className="flex items-center gap-1">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8 text-muted-foreground"
+          onClick={() => onMove(index, index - 1)}
+          disabled={disabled || !canMoveUp}
+          aria-label={t("proxy.failoverQueue.moveUp", {
+            defaultValue: "上移",
+          })}
+        >
+          {isReordering ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <ChevronUp className="h-4 w-4" />
+          )}
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8 text-muted-foreground"
+          onClick={() => onMove(index, index + 1)}
+          disabled={disabled || !canMoveDown}
+          aria-label={t("proxy.failoverQueue.moveDown", {
+            defaultValue: "下移",
+          })}
+        >
+          {isReordering ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <ChevronDown className="h-4 w-4" />
+          )}
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8 text-muted-foreground hover:text-destructive"
+          onClick={() => onRemove(item.providerId)}
+          disabled={disabled || isRemoving}
+          aria-label={t("common.delete", "删除")}
+        >
+          {isRemoving ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <Trash2 className="h-4 w-4" />
+          )}
+        </Button>
+      </div>
     </div>
   );
 }
