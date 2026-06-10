@@ -70,6 +70,11 @@ export const useAddProviderMutation = (appId: AppId) => {
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
+      await queryClient.invalidateQueries({ queryKey: ["failoverQueue", appId] });
+      await queryClient.invalidateQueries({
+        queryKey: ["availableProvidersForFailover", appId],
+      });
+      await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
 
       if (appId === "opencode") {
         await queryClient.invalidateQueries({
@@ -143,6 +148,11 @@ export const useUpdateProviderMutation = (appId: AppId) => {
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
+      await queryClient.invalidateQueries({ queryKey: ["failoverQueue", appId] });
+      await queryClient.invalidateQueries({
+        queryKey: ["availableProvidersForFailover", appId],
+      });
+      await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
       if (appId === "openclaw") {
         await queryClient.invalidateQueries({
           queryKey: openclawKeys.health,
@@ -182,6 +192,11 @@ export const useDeleteProviderMutation = (appId: AppId) => {
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
+      await queryClient.invalidateQueries({ queryKey: ["failoverQueue", appId] });
+      await queryClient.invalidateQueries({
+        queryKey: ["availableProvidersForFailover", appId],
+      });
+      await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
 
       if (appId === "opencode") {
         await queryClient.invalidateQueries({
@@ -248,8 +263,8 @@ export const useSwitchProviderMutation = (appId: AppId) => {
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
+      await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
       if (appId === "claude-desktop") {
-        await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
         await queryClient.invalidateQueries({
           queryKey: ["claudeDesktopStatus"],
         });

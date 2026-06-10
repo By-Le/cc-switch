@@ -1,7 +1,7 @@
 /**
  * 故障转移队列管理组件
  *
- * 允许用户管理代理模式下的故障转移队列，支持：
+ * 允许用户管理代理模式下的故障转移与负载分流队列，支持：
  * - 添加/移除供应商
  * - 队列顺序基于首页供应商列表的 sort_index
  */
@@ -13,6 +13,7 @@ import { Plus, Trash2, Loader2, Info, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import {
   Select,
   SelectContent,
@@ -141,7 +142,7 @@ export function FailoverQueueManager({
           <p className="text-xs text-muted-foreground">
             {t("proxy.failover.autoSwitchDescription", {
               defaultValue:
-                "开启后将立即切换到队列 P1，并在请求失败时自动切换到队列中的下一个供应商",
+                "外部应用接管到本地代理后，代理按队列选择 Provider；负载限制只影响新会话分配",
             })}
           </p>
         </div>
@@ -158,7 +159,7 @@ export function FailoverQueueManager({
         <AlertDescription className="text-sm">
           {t(
             "proxy.failoverQueue.info",
-            "队列顺序与首页供应商列表顺序一致。当请求失败时，系统会按顺序依次尝试队列中的供应商。",
+            "外部应用只需要接管到本地代理，主界面不需要同时启用多个 Provider。启用自动故障转移后，本地代理会按队列选择供应商；配置负载限制后，新会话按负载分流，已绑定会话保持原后端。",
           )}
         </AlertDescription>
       </Alert>
@@ -243,7 +244,7 @@ export function FailoverQueueManager({
         <p className="text-xs text-muted-foreground">
           {t(
             "proxy.failoverQueue.orderHint",
-            "队列顺序与首页供应商列表顺序一致，可在首页拖拽调整顺序。",
+            "主界面单选配置是正常的；队列才是多 Provider 分流入口。未配置负载限制时按首页供应商顺序尝试，配置后按实时负载选择。",
           )}
         </p>
       )}
@@ -267,6 +268,7 @@ function QueueItem({
   isRemoving,
 }: QueueItemProps) {
   const { t } = useTranslation();
+  const loadLimitBadges = getLoadLimitBadges(item, t);
 
   return (
     <div
@@ -289,6 +291,17 @@ function QueueItem({
             </span>
           )}
         </span>
+        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+          {loadLimitBadges.map((badge) => (
+            <Badge
+              key={badge}
+              variant="outline"
+              className="rounded-md px-1.5 py-0 text-[11px] font-normal text-muted-foreground"
+            >
+              {badge}
+            </Badge>
+          ))}
+        </div>
       </div>
 
       {/* 删除按钮 */}
@@ -308,4 +321,41 @@ function QueueItem({
       </Button>
     </div>
   );
+}
+
+function getLoadLimitBadges(
+  item: FailoverQueueItem,
+  t: ReturnType<typeof useTranslation>["t"],
+) {
+  const maxConcurrent = item.loadLimits?.maxConcurrent ?? 0;
+  const rpm = item.loadLimits?.rpm ?? 0;
+  const badges: string[] = [];
+
+  if (maxConcurrent > 0) {
+    badges.push(
+      t("proxy.failoverQueue.maxConcurrentBadge", {
+        count: maxConcurrent,
+        defaultValue: "并发 {{count}}",
+      }),
+    );
+  }
+
+  if (rpm > 0) {
+    badges.push(
+      t("proxy.failoverQueue.rpmBadge", {
+        count: rpm,
+        defaultValue: "RPM {{count}}",
+      }),
+    );
+  }
+
+  if (badges.length === 0) {
+    badges.push(
+      t("proxy.failoverQueue.unlimitedLoad", {
+        defaultValue: "负载不限制",
+      }),
+    );
+  }
+
+  return badges;
 }

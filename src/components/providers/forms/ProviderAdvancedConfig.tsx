@@ -22,6 +22,15 @@ import type { ProviderLoadLimits, ProviderTestConfig } from "@/types";
 
 export type PricingModelSourceOption = "inherit" | "request" | "response";
 
+const parseOptionalLoadLimit = (value: string): number | undefined => {
+  if (value.trim() === "") {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  return Number.isNaN(parsed) ? undefined : parsed;
+};
+
 interface ProviderPricingConfig {
   enabled: boolean;
   costMultiplier?: string;
@@ -277,14 +286,15 @@ export function ProviderAdvancedConfig({
           <div className="border-t border-border/50 p-4 space-y-4">
             <p className="text-sm text-muted-foreground">
               {t("providerAdvanced.loadLimitsDesc", {
-                defaultValue: "本地路由按会话保持后端；限制仅影响新会话分配。",
+                defaultValue:
+                  "仅在本地代理的自动故障转移队列生效：主界面仍单选配置；外部应用接管到本地代理后，新会话才会按负载分配到队列 Provider。",
               })}
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label htmlFor="load-max-concurrent">
                   {t("providerAdvanced.maxConcurrent", {
-                    defaultValue: "会话并发上限",
+                    defaultValue: "并发上限",
                   })}
                 </Label>
                 <Input
@@ -296,9 +306,7 @@ export function ProviderAdvancedConfig({
                   onChange={(e) =>
                     onLoadLimitsChange({
                       ...loadLimits,
-                      maxConcurrent: e.target.value
-                        ? parseInt(e.target.value, 10)
-                        : undefined,
+                      maxConcurrent: parseOptionalLoadLimit(e.target.value),
                     })
                   }
                   placeholder="20"
@@ -306,7 +314,7 @@ export function ProviderAdvancedConfig({
                 <p className="text-xs text-muted-foreground">
                   {t("providerAdvanced.maxConcurrentHint", {
                     defaultValue:
-                      "限制绑定到此供应商的活跃会话数；0 或留空表示不限制。",
+                      "限制此 Provider 的活跃会话和无会话请求；0 或留空表示不限制。",
                   })}
                 </p>
               </div>
@@ -325,9 +333,7 @@ export function ProviderAdvancedConfig({
                   onChange={(e) =>
                     onLoadLimitsChange({
                       ...loadLimits,
-                      rpm: e.target.value
-                        ? parseInt(e.target.value, 10)
-                        : undefined,
+                      rpm: parseOptionalLoadLimit(e.target.value),
                     })
                   }
                   placeholder="100"

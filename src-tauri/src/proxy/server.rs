@@ -391,17 +391,17 @@ pub(crate) async fn status_snapshot(state: &ProxyState) -> ProxyStatus {
 
     let mut active_provider_sessions = Vec::new();
     for target in session_targets {
-        let provider_name = current_providers
-            .get(&target.app_type)
-            .filter(|(provider_id, _)| provider_id == &target.provider_id)
-            .map(|(_, provider_name)| provider_name.clone())
+        let provider_name = state
+            .db
+            .get_provider_by_id(&target.provider_id, &target.app_type)
+            .ok()
+            .flatten()
+            .map(|provider| provider.name)
             .or_else(|| {
-                state
-                    .db
-                    .get_provider_by_id(&target.provider_id, &target.app_type)
-                    .ok()
-                    .flatten()
-                    .map(|provider| provider.name)
+                current_providers
+                    .get(&target.app_type)
+                    .filter(|(provider_id, _)| provider_id == &target.provider_id)
+                    .map(|(_, provider_name)| provider_name.clone())
             })
             .unwrap_or_else(|| target.provider_id.clone());
 
@@ -409,7 +409,7 @@ pub(crate) async fn status_snapshot(state: &ProxyState) -> ProxyStatus {
             app_type: target.app_type,
             provider_id: target.provider_id,
             provider_name,
-            active_connections: target.session_ids.len(),
+            active_connections: target.active_connections,
             session_ids: target.session_ids,
         });
     }
@@ -420,16 +420,40 @@ pub(crate) async fn status_snapshot(state: &ProxyState) -> ProxyStatus {
             .then_with(|| b.active_connections.cmp(&a.active_connections))
             .then_with(|| a.provider_id.cmp(&b.provider_id))
     });
+
+    let active_targets_by_provider: std::collections::HashMap<_, _> = active_provider_sessions
+        .iter()
+        .map(|target| {
+            (
+                (target.app_type.clone(), target.provider_id.clone()),
+                (target.active_connections, target.session_ids.clone()),
+            )
+        })
+        .collect();
     status.active_provider_sessions = active_provider_sessions;
 
     status.active_targets = current_providers
         .iter()
-        .map(|(app_type, (provider_id, provider_name))| ActiveTarget {
-            app_type: app_type.clone(),
-            provider_id: provider_id.clone(),
-            provider_name: provider_name.clone(),
-            active_connections: 0,
-            session_ids: Vec::new(),
+        .map(|(app_type, (provider_id, provider_name))| {
+            let (active_connections, session_ids) = active_targets_by_provider
+                .get(&(app_type.clone(), provider_id.clone()))
+                .cloned()
+                .unwrap_or_default();
+            let provider_name = state
+                .db
+                .get_provider_by_id(provider_id, app_type)
+                .ok()
+                .flatten()
+                .map(|provider| provider.name)
+                .unwrap_or_else(|| provider_name.clone());
+
+            ActiveTarget {
+                app_type: app_type.clone(),
+                provider_id: provider_id.clone(),
+                provider_name,
+                active_connections,
+                session_ids,
+            }
         })
         .collect();
 

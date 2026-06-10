@@ -680,7 +680,7 @@ export function ProviderList({
             ) : (
               <p className="text-sm text-muted-foreground">
                 {t("provider.noActiveSessions", {
-                  defaultValue: "暂无活跃会话 ID。",
+                  defaultValue: "暂无活跃会话 ID，当前连接可能来自无会话请求。",
                 })}
               </p>
             )}

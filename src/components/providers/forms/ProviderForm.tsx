@@ -179,11 +179,12 @@ export const normalizeCodexCatalogModelsForSave = (
 export const normalizeProviderLoadLimitsForSave = (
   limits: ProviderLoadLimits,
 ): ProviderLoadLimits | undefined => {
-  const maxConcurrent =
-    limits.maxConcurrent && limits.maxConcurrent > 0
-      ? limits.maxConcurrent
+  const normalizePositiveInteger = (value?: number) =>
+    value !== undefined && Number.isInteger(value) && value > 0
+      ? value
       : undefined;
-  const rpm = limits.rpm && limits.rpm > 0 ? limits.rpm : undefined;
+  const maxConcurrent = normalizePositiveInteger(limits.maxConcurrent);
+  const rpm = normalizePositiveInteger(limits.rpm);
 
   if (!maxConcurrent && !rpm) {
     return undefined;

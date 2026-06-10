@@ -137,6 +137,9 @@ export function useAddToFailoverQueue() {
       queryClient.invalidateQueries({
         queryKey: ["providers", variables.appType],
       });
+      queryClient.invalidateQueries({
+        queryKey: ["proxyStatus"],
+      });
     },
   });
 }
@@ -164,6 +167,9 @@ export function useRemoveFromFailoverQueue() {
       });
       queryClient.invalidateQueries({
         queryKey: ["providers", variables.appType],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["proxyStatus"],
       });
       // 清除该供应商的健康状态缓存（退出队列后不再需要健康监控）
       queryClient.invalidateQueries({

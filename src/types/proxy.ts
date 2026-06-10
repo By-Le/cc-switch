@@ -1,3 +1,5 @@
+import type { ProviderLoadLimits } from "@/types";
+
 export interface ProxyConfig {
   listen_address: string;
   listen_port: number;
@@ -115,6 +117,7 @@ export interface FailoverQueueItem {
   providerId: string;
   providerName: string;
   providerNotes?: string;
+  loadLimits?: ProviderLoadLimits;
   sortIndex?: number;
   enabled?: boolean;
 }

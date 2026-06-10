@@ -420,6 +420,9 @@ pnpm test:unit:watch
 # Build application
 pnpm build
 
+# Build Windows MSI installer
+pnpm run build:windows
+
 # Build debug version
 pnpm tauri build --debug
 ```

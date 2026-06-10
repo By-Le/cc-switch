@@ -95,9 +95,13 @@ export function useSetProxyTakeoverForApp() {
   return useMutation({
     mutationFn: ({ appType, enabled }: { appType: string; enabled: boolean }) =>
       proxyApi.setProxyTakeoverForApp(appType, enabled),
-    onSuccess: () => {
+    onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ["proxyTakeoverStatus"] });
       queryClient.invalidateQueries({ queryKey: ["liveTakeoverActive"] });
+      queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
+      queryClient.invalidateQueries({
+        queryKey: ["providers", variables.appType],
+      });
     },
   });
 }

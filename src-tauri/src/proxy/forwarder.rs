@@ -8,7 +8,7 @@ use super::{
     error::*,
     failover_switch::FailoverSwitchManager,
     json_canonical::{canonicalize_value, short_value_hash},
-    load_balancer::{ProviderLoadBalancer, ProviderLoadPermit},
+    load_balancer::{ProviderLoadBalancer, ProviderLoadPermit, ProviderLoadRejectReason},
     log_codes::fwd as log_fwd,
     provider_router::ProviderRouter,
     providers::{
@@ -274,6 +274,55 @@ impl RequestForwarder {
         }
     }
 
+    async fn finalize_provider_success(
+        &self,
+        app_type_str: &str,
+        provider: &Provider,
+        used_half_open_permit: bool,
+        load_permit: &mut ProviderLoadPermit,
+        should_switch_on_success: bool,
+    ) {
+        self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
+            .await;
+        self.bind_provider_session_success(app_type_str, &provider.id, load_permit)
+            .await;
+
+        if should_update_active_target_after_success(
+            &self.current_provider_id_at_start,
+            &provider.id,
+            should_switch_on_success,
+        ) {
+            let mut current_providers = self.current_providers.write().await;
+            current_providers.insert(
+                app_type_str.to_string(),
+                (provider.id.clone(), provider.name.clone()),
+            );
+        }
+
+        {
+            let mut status = self.status.write().await;
+            status.success_requests += 1;
+            status.last_error = None;
+            if should_switch_on_success {
+                status.failover_count += 1;
+
+                let fm = self.failover_manager.clone();
+                let ah = self.app_handle.clone();
+                let pid = provider.id.clone();
+                let pname = provider.name.clone();
+                let at = app_type_str.to_string();
+
+                tokio::spawn(async move {
+                    let _ = fm.try_switch(ah.as_ref(), &at, &pid, &pname).await;
+                });
+            }
+            if status.total_requests > 0 {
+                status.success_rate =
+                    (status.success_requests as f32 / status.total_requests as f32) * 100.0;
+            }
+        }
+    }
+
     /// 整流（thinking signature 或 budget）重试失败后的统一收尾。
     ///
     /// `None` 表示已记录熔断器、累积 `last_error`/`last_provider`，
@@ -410,6 +459,9 @@ impl RequestForwarder {
         let mut last_error = None;
         let mut last_provider = None;
         let mut attempted_providers = 0usize;
+        let mut circuit_rejected_providers = 0usize;
+        let mut concurrency_rejected_providers = 0usize;
+        let mut rpm_rejected_providers = 0usize;
 
         // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）
         let bypass_circuit_breaker = providers.len() == 1;
@@ -446,6 +498,7 @@ impl RequestForwarder {
             };
 
             if !allowed {
+                circuit_rejected_providers = circuit_rejected_providers.saturating_add(1);
                 continue;
             }
 
@@ -454,17 +507,29 @@ impl RequestForwarder {
             } else {
                 ""
             };
-            let Ok(mut load_permit) = self
+            let mut load_permit = match self
                 .load_balancer
                 .acquire(app_type_str, load_session_id, provider)
                 .await
-            else {
-                if used_half_open_permit {
-                    self.router
-                        .release_permit_neutral(&provider.id, app_type_str, true)
-                        .await;
+            {
+                Ok(load_permit) => load_permit,
+                Err(rejected) => {
+                    match rejected.reason {
+                        ProviderLoadRejectReason::ConcurrencyFull => {
+                            concurrency_rejected_providers =
+                                concurrency_rejected_providers.saturating_add(1);
+                        }
+                        ProviderLoadRejectReason::RpmFull => {
+                            rpm_rejected_providers = rpm_rejected_providers.saturating_add(1);
+                        }
+                    }
+                    if used_half_open_permit {
+                        self.router
+                            .release_permit_neutral(&provider.id, app_type_str, true)
+                            .await;
+                    }
+                    continue;
                 }
-                continue;
             };
 
             // PRE-SEND 优化器：每个 provider 独立决定是否优化
@@ -511,54 +576,19 @@ impl RequestForwarder {
                 .await
             {
                 Ok((response, claude_api_format)) => {
-                    // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
-                    // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
-                    self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
-                        .await;
-                    self.bind_provider_session_success(
-                        app_type_str,
+                    let should_switch_on_success = should_switch_after_success(
+                        &self.current_provider_id_at_start,
                         &provider.id,
+                        last_provider.is_some(),
+                    );
+                    self.finalize_provider_success(
+                        app_type_str,
+                        provider,
+                        used_half_open_permit,
                         &mut load_permit,
+                        should_switch_on_success,
                     )
                     .await;
-
-                    // 更新当前应用类型使用的 provider
-                    {
-                        let mut current_providers = self.current_providers.write().await;
-                        current_providers.insert(
-                            app_type_str.to_string(),
-                            (provider.id.clone(), provider.name.clone()),
-                        );
-                    }
-
-                    // 更新成功统计
-                    {
-                        let mut status = self.status.write().await;
-                        status.success_requests += 1;
-                        status.last_error = None;
-                        let should_switch =
-                            self.current_provider_id_at_start.as_str() != provider.id.as_str();
-                        if should_switch {
-                            status.failover_count += 1;
-
-                            // 异步触发供应商切换，更新 UI/托盘，并把“当前供应商”同步为实际使用的 provider
-                            let fm = self.failover_manager.clone();
-                            let ah = self.app_handle.clone();
-                            let pid = provider.id.clone();
-                            let pname = provider.name.clone();
-                            let at = app_type_str.to_string();
-
-                            tokio::spawn(async move {
-                                let _ = fm.try_switch(ah.as_ref(), &at, &pid, &pname).await;
-                            });
-                        }
-                        // 重新计算成功率
-                        if status.total_requests > 0 {
-                            status.success_rate = (status.success_requests as f32
-                                / status.total_requests as f32)
-                                * 100.0;
-                        }
-                    }
 
                     return Ok(ForwardResult {
                         response,
@@ -619,55 +649,19 @@ impl RequestForwarder {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
-                                    self.record_success_result(
+                                    let should_switch_on_success = should_switch_after_success(
+                                        &self.current_provider_id_at_start,
                                         &provider.id,
+                                        last_provider.is_some(),
+                                    );
+                                    self.finalize_provider_success(
                                         app_type_str,
+                                        provider,
                                         used_half_open_permit,
-                                    )
-                                    .await;
-                                    self.bind_provider_session_success(
-                                        app_type_str,
-                                        &provider.id,
                                         &mut load_permit,
+                                        should_switch_on_success,
                                     )
                                     .await;
-
-                                    {
-                                        let mut current_providers =
-                                            self.current_providers.write().await;
-                                        current_providers.insert(
-                                            app_type_str.to_string(),
-                                            (provider.id.clone(), provider.name.clone()),
-                                        );
-                                    }
-
-                                    {
-                                        let mut status = self.status.write().await;
-                                        status.success_requests += 1;
-                                        status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
-                                                != provider.id.as_str();
-                                        if should_switch {
-                                            status.failover_count += 1;
-                                            let fm = self.failover_manager.clone();
-                                            let ah = self.app_handle.clone();
-                                            let pid = provider.id.clone();
-                                            let pname = provider.name.clone();
-                                            let at = app_type_str.to_string();
-
-                                            tokio::spawn(async move {
-                                                let _ = fm
-                                                    .try_switch(ah.as_ref(), &at, &pid, &pname)
-                                                    .await;
-                                            });
-                                        }
-                                        if status.total_requests > 0 {
-                                            status.success_rate = (status.success_requests as f32
-                                                / status.total_requests as f32)
-                                                * 100.0;
-                                        }
-                                    }
 
                                     return Ok(ForwardResult {
                                         response,
@@ -769,60 +763,19 @@ impl RequestForwarder {
                                 {
                                     Ok((response, claude_api_format)) => {
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
-                                        self.record_success_result(
+                                        let should_switch_on_success = should_switch_after_success(
+                                            &self.current_provider_id_at_start,
                                             &provider.id,
+                                            last_provider.is_some(),
+                                        );
+                                        self.finalize_provider_success(
                                             app_type_str,
+                                            provider,
                                             used_half_open_permit,
-                                        )
-                                        .await;
-                                        self.bind_provider_session_success(
-                                            app_type_str,
-                                            &provider.id,
                                             &mut load_permit,
+                                            should_switch_on_success,
                                         )
                                         .await;
-
-                                        // 更新当前应用类型使用的 provider
-                                        {
-                                            let mut current_providers =
-                                                self.current_providers.write().await;
-                                            current_providers.insert(
-                                                app_type_str.to_string(),
-                                                (provider.id.clone(), provider.name.clone()),
-                                            );
-                                        }
-
-                                        // 更新成功统计
-                                        {
-                                            let mut status = self.status.write().await;
-                                            status.success_requests += 1;
-                                            status.last_error = None;
-                                            let should_switch =
-                                                self.current_provider_id_at_start.as_str()
-                                                    != provider.id.as_str();
-                                            if should_switch {
-                                                status.failover_count += 1;
-
-                                                // 异步触发供应商切换，更新 UI/托盘
-                                                let fm = self.failover_manager.clone();
-                                                let ah = self.app_handle.clone();
-                                                let pid = provider.id.clone();
-                                                let pname = provider.name.clone();
-                                                let at = app_type_str.to_string();
-
-                                                tokio::spawn(async move {
-                                                    let _ = fm
-                                                        .try_switch(ah.as_ref(), &at, &pid, &pname)
-                                                        .await;
-                                                });
-                                            }
-                                            if status.total_requests > 0 {
-                                                status.success_rate = (status.success_requests
-                                                    as f32
-                                                    / status.total_requests as f32)
-                                                    * 100.0;
-                                            }
-                                        }
 
                                         return Ok(ForwardResult {
                                             response,
@@ -941,54 +894,19 @@ impl RequestForwarder {
                             {
                                 Ok((response, claude_api_format)) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
-                                    self.record_success_result(
+                                    let should_switch_on_success = should_switch_after_success(
+                                        &self.current_provider_id_at_start,
                                         &provider.id,
+                                        last_provider.is_some(),
+                                    );
+                                    self.finalize_provider_success(
                                         app_type_str,
+                                        provider,
                                         used_half_open_permit,
-                                    )
-                                    .await;
-                                    self.bind_provider_session_success(
-                                        app_type_str,
-                                        &provider.id,
                                         &mut load_permit,
+                                        should_switch_on_success,
                                     )
                                     .await;
-
-                                    {
-                                        let mut current_providers =
-                                            self.current_providers.write().await;
-                                        current_providers.insert(
-                                            app_type_str.to_string(),
-                                            (provider.id.clone(), provider.name.clone()),
-                                        );
-                                    }
-
-                                    {
-                                        let mut status = self.status.write().await;
-                                        status.success_requests += 1;
-                                        status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
-                                                != provider.id.as_str();
-                                        if should_switch {
-                                            status.failover_count += 1;
-                                            let fm = self.failover_manager.clone();
-                                            let ah = self.app_handle.clone();
-                                            let pid = provider.id.clone();
-                                            let pname = provider.name.clone();
-                                            let at = app_type_str.to_string();
-                                            tokio::spawn(async move {
-                                                let _ = fm
-                                                    .try_switch(ah.as_ref(), &at, &pid, &pname)
-                                                    .await;
-                                            });
-                                        }
-                                        if status.total_requests > 0 {
-                                            status.success_rate = (status.success_requests as f32
-                                                / status.total_requests as f32)
-                                                * 100.0;
-                                        }
-                                    }
 
                                     return Ok(ForwardResult {
                                         response,
@@ -1112,11 +1030,17 @@ impl RequestForwarder {
         }
 
         if attempted_providers == 0 {
-            // providers 列表非空，但全部被熔断器拒绝（典型：HalfOpen 探测名额被占用）
+            // providers 列表非空，但请求没有真正发到任何上游：
+            // 可能是熔断器拒绝，也可能是 Provider 负载限制已满。
+            let unavailable_message = build_no_attempt_unavailable_message(
+                circuit_rejected_providers,
+                concurrency_rejected_providers,
+                rpm_rejected_providers,
+            );
             {
                 let mut status = self.status.write().await;
                 status.failed_requests += 1;
-                status.last_error = Some("所有供应商暂时不可用（熔断器限制）".to_string());
+                status.last_error = Some(unavailable_message.to_string());
                 if status.total_requests > 0 {
                     status.success_rate =
                         (status.success_requests as f32 / status.total_requests as f32) * 100.0;
@@ -2196,6 +2120,47 @@ fn is_bedrock_provider(provider: &Provider) -> bool {
         .unwrap_or(false)
 }
 
+fn build_no_attempt_unavailable_message(
+    circuit_rejected_providers: usize,
+    concurrency_rejected_providers: usize,
+    rpm_rejected_providers: usize,
+) -> &'static str {
+    let load_rejected_providers =
+        concurrency_rejected_providers.saturating_add(rpm_rejected_providers);
+
+    match (circuit_rejected_providers > 0, load_rejected_providers > 0) {
+        (true, true) => "所有供应商暂时不可用（熔断器或负载限制）",
+        (true, false) => "所有供应商暂时不可用（熔断器限制）",
+        (false, true) if concurrency_rejected_providers > 0 && rpm_rejected_providers > 0 => {
+            "所有供应商暂时不可用（并发或 RPM 限制已满）"
+        }
+        (false, true) if concurrency_rejected_providers > 0 => {
+            "所有供应商暂时不可用（并发限制已满）"
+        }
+        (false, true) if rpm_rejected_providers > 0 => "所有供应商暂时不可用（RPM 限制已满）",
+        (false, true) => "所有供应商暂时不可用（负载限制）",
+        (false, false) => "无可用的 Provider",
+    }
+}
+
+fn should_switch_after_success(
+    current_provider_id_at_start: &str,
+    successful_provider_id: &str,
+    had_provider_failure: bool,
+) -> bool {
+    had_provider_failure && current_provider_id_at_start != successful_provider_id
+}
+
+fn should_update_active_target_after_success(
+    current_provider_id_at_start: &str,
+    successful_provider_id: &str,
+    should_switch_on_success: bool,
+) -> bool {
+    current_provider_id_at_start.is_empty()
+        || current_provider_id_at_start == successful_provider_id
+        || should_switch_on_success
+}
+
 fn build_retryable_failure_log(
     provider_name: &str,
     attempted_providers: usize,
@@ -2732,6 +2697,53 @@ mod tests {
         assert_eq!(code, log_fwd::ALL_PROVIDERS_FAILED);
         assert!(message.contains("已尝试 2/2 个 Provider，均失败"));
         assert!(message.contains("connection reset by peer"));
+    }
+
+    #[test]
+    fn no_attempt_message_reports_load_rejection_reason() {
+        assert_eq!(
+            build_no_attempt_unavailable_message(0, 2, 0),
+            "所有供应商暂时不可用（并发限制已满）"
+        );
+        assert_eq!(
+            build_no_attempt_unavailable_message(0, 0, 2),
+            "所有供应商暂时不可用（RPM 限制已满）"
+        );
+        assert_eq!(
+            build_no_attempt_unavailable_message(0, 1, 1),
+            "所有供应商暂时不可用（并发或 RPM 限制已满）"
+        );
+    }
+
+    #[test]
+    fn no_attempt_message_reports_mixed_unavailable_reason() {
+        assert_eq!(
+            build_no_attempt_unavailable_message(1, 1, 0),
+            "所有供应商暂时不可用（熔断器或负载限制）"
+        );
+        assert_eq!(
+            build_no_attempt_unavailable_message(2, 0, 0),
+            "所有供应商暂时不可用（熔断器限制）"
+        );
+    }
+
+    #[test]
+    fn load_distribution_success_does_not_switch_current_provider() {
+        assert!(!should_switch_after_success("p1", "p2", false));
+    }
+
+    #[test]
+    fn provider_failure_success_switches_current_provider() {
+        assert!(should_switch_after_success("p1", "p2", true));
+        assert!(!should_switch_after_success("p1", "p1", true));
+    }
+
+    #[test]
+    fn load_distribution_success_does_not_update_active_target() {
+        assert!(!should_update_active_target_after_success("p1", "p2", false));
+        assert!(should_update_active_target_after_success("p1", "p1", false));
+        assert!(should_update_active_target_after_success("p1", "p2", true));
+        assert!(should_update_active_target_after_success("", "p2", false));
     }
 
     #[test]

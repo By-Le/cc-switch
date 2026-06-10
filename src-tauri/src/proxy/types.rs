@@ -100,7 +100,7 @@ pub struct ActiveTarget {
     pub app_type: String, // "Claude" | "Codex" | "Gemini"
     pub provider_name: String,
     pub provider_id: String,
-    /// 该 Provider 当前绑定的活跃会话数。
+    /// 该 Provider 当前占用的活跃连接数，包含已绑定会话槽位和无会话请求。
     #[serde(default)]
     pub active_connections: usize,
     /// 当前绑定到该 Provider 的会话 ID 列表。

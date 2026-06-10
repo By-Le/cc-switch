@@ -4,7 +4,7 @@
 
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
-use crate::provider::Provider;
+use crate::provider::{Provider, ProviderLoadLimits};
 use serde::{Deserialize, Serialize};
 
 /// 故障转移队列条目（简化版，用于前端展示）
@@ -14,6 +14,8 @@ pub struct FailoverQueueItem {
     pub provider_id: String,
     pub provider_name: String,
     pub sort_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_limits: Option<ProviderLoadLimits>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_notes: Option<String>,
 }
@@ -25,7 +27,7 @@ impl Database {
 
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, sort_index, notes
+                "SELECT id, name, sort_index, notes, meta
                  FROM providers
                  WHERE app_type = ?1 AND in_failover_queue = 1
                  ORDER BY COALESCE(sort_index, 999999), id ASC",
@@ -39,6 +41,7 @@ impl Database {
                     provider_name: row.get(1)?,
                     sort_index: row.get(2)?,
                     provider_notes: row.get(3)?,
+                    load_limits: provider_load_limits_from_meta(row.get(4)?),
                 })
             })
             .map_err(|e| AppError::Database(e.to_string()))?
@@ -146,4 +149,11 @@ impl Database {
 
         Ok(available)
     }
+}
+
+fn provider_load_limits_from_meta(meta_json: Option<String>) -> Option<ProviderLoadLimits> {
+    meta_json
+        .and_then(|meta| serde_json::from_str::<crate::provider::ProviderMeta>(&meta).ok())
+        .and_then(|meta| meta.load_limits)
+        .filter(|limits| limits.has_limits())
 }

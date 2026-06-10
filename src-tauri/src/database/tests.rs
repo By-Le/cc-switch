@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::app_config::MultiAppConfig;
-use crate::provider::{Provider, ProviderManager};
+use crate::provider::{Provider, ProviderLoadLimits, ProviderManager, ProviderMeta};
 use indexmap::IndexMap;
 use rusqlite::{params, Connection};
 use serde_json::json;
@@ -601,6 +601,65 @@ fn dry_run_validates_schema_compatibility() {
         result.is_ok(),
         "Dry-run should succeed with provider data: {result:?}"
     );
+}
+
+#[test]
+fn failover_queue_items_include_load_limits() {
+    let db = Database::memory().expect("create memory db");
+
+    let mut limited = Provider::with_id(
+        "limited".to_string(),
+        "Limited Provider".to_string(),
+        json!({}),
+        None,
+    );
+    limited.sort_index = Some(1);
+    limited.meta = Some(ProviderMeta {
+        load_limits: Some(ProviderLoadLimits {
+            max_concurrent: Some(2),
+            rpm: Some(60),
+        }),
+        ..ProviderMeta::default()
+    });
+
+    let mut unlimited = Provider::with_id(
+        "unlimited".to_string(),
+        "Unlimited Provider".to_string(),
+        json!({}),
+        None,
+    );
+    unlimited.sort_index = Some(2);
+
+    db.save_provider("claude", &limited)
+        .expect("save limited provider");
+    db.save_provider("claude", &unlimited)
+        .expect("save unlimited provider");
+    db.add_to_failover_queue("claude", "limited")
+        .expect("add limited provider to queue");
+    db.add_to_failover_queue("claude", "unlimited")
+        .expect("add unlimited provider to queue");
+
+    let queue = db.get_failover_queue("claude").expect("get queue");
+
+    assert_eq!(queue.len(), 2);
+    assert_eq!(queue[0].provider_id, "limited");
+    assert_eq!(
+        queue[0].load_limits,
+        Some(ProviderLoadLimits {
+            max_concurrent: Some(2),
+            rpm: Some(60),
+        })
+    );
+    assert_eq!(queue[1].provider_id, "unlimited");
+    assert!(queue[1].load_limits.is_none());
+
+    let serialized = serde_json::to_value(&queue[0]).expect("serialize queue item");
+    assert_eq!(serialized["providerId"], "limited");
+    assert_eq!(serialized["providerName"], "Limited Provider");
+    assert_eq!(serialized["loadLimits"]["maxConcurrent"], 2);
+    assert_eq!(serialized["loadLimits"]["rpm"], 60);
+    assert!(serialized.get("provider_id").is_none());
+    assert!(serialized.get("load_limits").is_none());
 }
 
 #[test]

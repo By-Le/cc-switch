@@ -44,7 +44,7 @@ pub struct RequestContext {
     /// 请求开始时的"当前供应商"（用于判断是否需要同步 UI/托盘）
     ///
     /// 这里使用本地 settings 的设备级 current provider。
-    /// 代理模式下如果实际使用的 provider 与此不一致，会触发切换以确保 UI 始终准确。
+    /// 代理模式下只有真实故障转移成功才会同步切换；纯负载分流命中不会改写主配置。
     pub current_provider_id: String,
     /// 请求中的模型名称
     pub request_model: String,
@@ -137,6 +137,9 @@ impl RequestContext {
                 crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
                 _ => ProxyError::DatabaseError(e.to_string()),
             })?;
+
+        // 这里把队列候选交给负载均衡器：已绑定会话优先原 Provider，
+        // 新会话在存在 loadLimits 时按实时负载动态排序。
         let sticky_session_id = if session_result.client_provided {
             session_id.as_str()
         } else {

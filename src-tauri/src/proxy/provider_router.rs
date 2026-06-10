@@ -31,9 +31,10 @@ impl ProviderRouter {
 
     /// 选择可用的供应商（支持故障转移）
     ///
-    /// 返回按优先级排序的可用供应商列表：
+    /// 返回基础候选供应商列表：
     /// - 故障转移关闭时：仅返回当前供应商
-    /// - 故障转移开启时：仅使用故障转移队列，按队列顺序依次尝试（P1 → P2 → ...）
+    /// - 故障转移开启时：仅使用故障转移队列，初始顺序为队列顺序（P1 → P2 → ...）
+    ///   后续会由 load balancer 根据会话绑定和负载限制调整新会话尝试顺序。
     pub async fn select_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
         let mut result = Vec::new();
         let mut total_providers = 0usize;
@@ -49,7 +50,7 @@ impl ProviderRouter {
         };
 
         if auto_failover_enabled {
-            // 故障转移开启：仅按队列顺序依次尝试（P1 → P2 → ...）
+            // 故障转移开启：候选集来自队列，初始顺序为 P1 → P2 → ...
             let all_providers = self.db.get_all_providers(app_type)?;
 
             // 使用 DAO 返回的排序结果，确保和前端展示一致

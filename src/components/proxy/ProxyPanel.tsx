@@ -350,7 +350,9 @@ export function ProxyPanel({
 
               <div className="pt-3 border-t border-border space-y-2">
                 <p className="text-xs text-muted-foreground">
-                  {t("provider.inUse")}
+                  {t("proxy.panel.proxyTargets", {
+                    defaultValue: "代理目标",
+                  })}
                 </p>
                 {status.active_targets && status.active_targets.length > 0 ? (
                   <div className="grid gap-2 sm:grid-cols-2">
@@ -379,7 +381,7 @@ export function ProxyPanel({
                 ) : status.current_provider ? (
                   <p className="text-sm text-muted-foreground">
                     {t("proxy.panel.currentProvider", {
-                      defaultValue: "当前 Provider：",
+                      defaultValue: "代理目标：",
                     })}{" "}
                     <span className="font-medium text-foreground">
                       {status.current_provider}
@@ -388,7 +390,7 @@ export function ProxyPanel({
                 ) : (
                   <p className="text-sm text-yellow-600 dark:text-yellow-400">
                     {t("proxy.panel.waitingFirstRequest", {
-                      defaultValue: "当前 Provider：等待首次请求…",
+                      defaultValue: "代理目标：等待首次请求...",
                     })}
                   </p>
                 )}
@@ -661,6 +663,11 @@ function ProviderQueueGroup({
   const activeTarget = status.active_targets?.find(
     (t) => t.app_type === appType,
   );
+  const activeSessionsByProvider = new Map(
+    (status.active_provider_sessions ?? [])
+      .filter((target) => target.app_type === appType)
+      .map((target) => [target.provider_id, target]),
+  );
 
   return (
     <div className="space-y-2">
@@ -674,15 +681,22 @@ function ProviderQueueGroup({
 
       {/* 供应商列表 */}
       <div className="space-y-1.5">
-        {targets.map((target, index) => (
-          <ProviderQueueItem
-            key={target.id}
-            provider={target}
-            priority={index + 1}
-            appType={appType}
-            isCurrent={activeTarget?.provider_id === target.id}
-          />
-        ))}
+        {targets.map((target, index) => {
+          const activeSession = activeSessionsByProvider.get(target.id);
+          const activeConnectionCount =
+            activeSession?.active_connections ?? 0;
+
+          return (
+            <ProviderQueueItem
+              key={target.id}
+              provider={target}
+              priority={index + 1}
+              appType={appType}
+              isProxyTarget={activeTarget?.provider_id === target.id}
+              activeConnectionCount={activeConnectionCount}
+            />
+          );
+        })}
       </div>
     </div>
   );
@@ -695,22 +709,26 @@ interface ProviderQueueItemProps {
   };
   priority: number;
   appType: string;
-  isCurrent: boolean;
+  isProxyTarget: boolean;
+  activeConnectionCount: number;
 }
 
 function ProviderQueueItem({
   provider,
   priority,
   appType,
-  isCurrent,
+  isProxyTarget,
+  activeConnectionCount,
 }: ProviderQueueItemProps) {
   const { t } = useTranslation();
   const { data: health } = useProviderHealth(provider.id, appType);
+  const hasActiveConnections = activeConnectionCount > 0;
+  const isHighlighted = isProxyTarget || hasActiveConnections;
 
   return (
     <div
       className={`flex items-center justify-between rounded-md border px-3 py-2 text-sm transition-colors ${
-        isCurrent
+        isHighlighted
           ? "border-primary/40 bg-primary/10 text-primary font-medium"
           : "border-border bg-background/60"
       }`}
@@ -718,19 +736,29 @@ function ProviderQueueItem({
       <div className="flex items-center gap-2">
         <span
           className={`flex-shrink-0 flex items-center justify-center w-5 h-5 rounded-full text-xs font-bold ${
-            isCurrent
+            isHighlighted
               ? "bg-primary text-primary-foreground"
               : "bg-muted text-muted-foreground"
           }`}
         >
           {priority}
         </span>
-        <span className={isCurrent ? "" : "text-foreground"}>
+        <span className={isHighlighted ? "" : "text-foreground"}>
           {provider.name}
         </span>
-        {isCurrent && (
+        {isProxyTarget && (
           <span className="text-xs px-1.5 py-0.5 rounded bg-primary/20 text-primary">
-            {t("provider.inUse")}
+            {t("proxy.panel.proxyTargetBadge", {
+              defaultValue: "代理目标",
+            })}
+          </span>
+        )}
+        {hasActiveConnections && (
+          <span className="text-xs px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-300">
+            {activeConnectionCount}{" "}
+            {t("proxy.panel.routingBadge", {
+              defaultValue: "路由中",
+            })}
           </span>
         )}
       </div>

@@ -8,12 +8,16 @@
 use crate::provider::{Provider, ProviderLoadLimits};
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 const RPM_WINDOW: Duration = Duration::from_secs(60);
+const LOAD_SCORE_SCALE: u64 = 1_000_000;
 
 #[derive(Clone, Default)]
 pub struct ProviderLoadBalancer {
@@ -25,6 +29,9 @@ struct LoadState {
     semaphores: HashMap<String, Arc<Semaphore>>,
     rpm_windows: HashMap<String, VecDeque<Instant>>,
     sticky_sessions: HashMap<String, StickyProvider>,
+    active_requests: HashMap<(String, String), Arc<AtomicUsize>>,
+    active_unbound_requests: HashMap<(String, String), Arc<AtomicUsize>>,
+    round_robin_cursors: HashMap<String, usize>,
 }
 
 struct StickyProvider {
@@ -39,6 +46,7 @@ struct StickyProvider {
 pub(crate) struct ActiveSessionTarget {
     pub app_type: String,
     pub provider_id: String,
+    pub active_connections: usize,
     pub session_ids: Vec<String>,
 }
 
@@ -61,6 +69,8 @@ pub struct ProviderLoadRejected {
 
 pub struct ProviderLoadPermit {
     provider_key: String,
+    active_request_counter: Option<Arc<AtomicUsize>>,
+    active_unbound_request_counter: Option<Arc<AtomicUsize>>,
     semaphore_permit: Option<OwnedSemaphorePermit>,
     balancer: ProviderLoadBalancer,
 }
@@ -68,6 +78,12 @@ pub struct ProviderLoadPermit {
 impl Drop for ProviderLoadPermit {
     fn drop(&mut self) {
         let _ = self.semaphore_permit.take();
+        if let Some(counter) = self.active_unbound_request_counter.take() {
+            decrement_active_request_counter(&counter);
+        }
+        if let Some(counter) = self.active_request_counter.take() {
+            decrement_active_request_counter(&counter);
+        }
         let balancer = self.balancer.clone();
         let provider_key = self.provider_key.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -85,27 +101,32 @@ impl ProviderLoadBalancer {
         session_id: &str,
         providers: &[Provider],
     ) -> Vec<Provider> {
-        let Some(sticky_provider_id) = self.sticky_provider_id(app_type, session_id).await else {
+        if providers.len() <= 1 {
             return providers.to_vec();
         };
 
-        let Some(index) = providers
-            .iter()
-            .position(|provider| provider.id == sticky_provider_id)
-        else {
-            return providers.to_vec();
-        };
+        let mut inner = self.inner.write().await;
+        prune_sticky_sessions(&mut inner);
 
-        let mut ordered = Vec::with_capacity(providers.len());
-        ordered.push(providers[index].clone());
-        ordered.extend(
-            providers
+        if let Some(sticky_provider_id) =
+            sticky_provider_id_locked(&mut inner, app_type, session_id)
+        {
+            if let Some(index) = providers
                 .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != index)
-                .map(|(_, provider)| provider.clone()),
-        );
-        ordered
+                .position(|provider| provider.id == sticky_provider_id)
+            {
+                return reorder_with_provider_first(providers, index);
+            }
+        }
+
+        if !providers
+            .iter()
+            .any(|provider| provider_load_limits(provider).has_limits())
+        {
+            return providers.to_vec();
+        }
+
+        order_providers_by_load_locked(&mut inner, app_type, providers)
     }
 
     pub async fn acquire(
@@ -120,17 +141,45 @@ impl ProviderLoadBalancer {
                 .is_session_bound_to_provider(app_type, session_id, &provider.id)
                 .await
         {
-            return Ok(ProviderLoadPermit {
-                provider_key: provider_key(app_type, &provider.id),
-                semaphore_permit: None,
-                balancer: self.clone(),
-            });
+            let limits = provider_load_limits(provider);
+            let key = provider_key(app_type, &provider.id);
+            let mut inner = self.inner.write().await;
+            return match check_and_reserve_rpm(&mut inner, &key, limits.rpm_limit()) {
+                CapacityDecision::Available => {
+                    let active_request_counter =
+                        increment_active_request_locked(&mut inner, app_type, &provider.id);
+                    Ok(ProviderLoadPermit {
+                        provider_key: key,
+                        active_request_counter: Some(active_request_counter),
+                        active_unbound_request_counter: None,
+                        semaphore_permit: None,
+                        balancer: self.clone(),
+                    })
+                }
+                CapacityDecision::RpmFull => {
+                    log::debug!(
+                        "[{app_type}] Provider {} 达到 RPM 上限，尝试下一家",
+                        provider.id
+                    );
+                    Err(ProviderLoadRejected {
+                        reason: ProviderLoadRejectReason::RpmFull,
+                    })
+                }
+            };
         }
 
         let limits = provider_load_limits(provider);
         if !limits.has_limits() {
+            let key = provider_key(app_type, &provider.id);
+            let mut inner = self.inner.write().await;
+            let active_request_counter =
+                increment_active_request_locked(&mut inner, app_type, &provider.id);
+            let active_unbound_request_counter =
+                increment_active_unbound_request_locked(&mut inner, app_type, &provider.id);
             return Ok(ProviderLoadPermit {
-                provider_key: provider_key(app_type, &provider.id),
+                provider_key: key,
+                active_request_counter: Some(active_request_counter),
+                active_unbound_request_counter: Some(active_unbound_request_counter),
                 semaphore_permit: None,
                 balancer: self.clone(),
             });
@@ -138,25 +187,10 @@ impl ProviderLoadBalancer {
 
         let key = provider_key(app_type, &provider.id);
         let concurrency_limit = limits.max_concurrent_limit();
-        let semaphore = match (should_track_session, concurrency_limit) {
-            (true, Some(limit)) => {
+        let semaphore_permit = match concurrency_limit {
+            Some(limit) => {
                 let mut inner = self.inner.write().await;
-                let semaphore_key = semaphore_key(&key, limit);
-                Some(
-                    inner
-                        .semaphores
-                        .entry(semaphore_key)
-                        .or_insert_with(|| Arc::new(Semaphore::new(limit)))
-                        .clone(),
-                )
-            }
-            _ => None,
-        };
-
-        let semaphore_permit = match semaphore {
-            Some(semaphore) => match semaphore.try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
+                if current_concurrency_usage(&inner, app_type, &provider.id) >= limit {
                     log::debug!(
                         "[{app_type}] Provider {} 达到并发上限，尝试下一家",
                         provider.id
@@ -165,17 +199,45 @@ impl ProviderLoadBalancer {
                         reason: ProviderLoadRejectReason::ConcurrencyFull,
                     });
                 }
-            },
+
+                let semaphore_key = semaphore_key(&key, limit);
+                let semaphore = inner
+                    .semaphores
+                    .entry(semaphore_key)
+                    .or_insert_with(|| Arc::new(Semaphore::new(limit)))
+                    .clone();
+
+                match semaphore.try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        log::debug!(
+                            "[{app_type}] Provider {} 达到并发上限，尝试下一家",
+                            provider.id
+                        );
+                        return Err(ProviderLoadRejected {
+                            reason: ProviderLoadRejectReason::ConcurrencyFull,
+                        });
+                    }
+                }
+            }
             None => None,
         };
 
         let mut inner = self.inner.write().await;
         match check_and_reserve_rpm(&mut inner, &key, limits.rpm_limit()) {
-            CapacityDecision::Available => Ok(ProviderLoadPermit {
-                provider_key: key,
-                semaphore_permit,
-                balancer: self.clone(),
-            }),
+            CapacityDecision::Available => {
+                let active_request_counter =
+                    increment_active_request_locked(&mut inner, app_type, &provider.id);
+                let active_unbound_request_counter =
+                    increment_active_unbound_request_locked(&mut inner, app_type, &provider.id);
+                Ok(ProviderLoadPermit {
+                    provider_key: key,
+                    active_request_counter: Some(active_request_counter),
+                    active_unbound_request_counter: Some(active_unbound_request_counter),
+                    semaphore_permit,
+                    balancer: self.clone(),
+                })
+            }
             CapacityDecision::RpmFull => {
                 log::debug!(
                     "[{app_type}] Provider {} 达到 RPM 上限，尝试下一家",
@@ -200,6 +262,9 @@ impl ProviderLoadBalancer {
         }
 
         let session_slot = load_permit.semaphore_permit.take();
+        if let Some(counter) = load_permit.active_unbound_request_counter.take() {
+            decrement_active_request_counter(&counter);
+        }
         let mut inner = self.inner.write().await;
         bind_session_locked(&mut inner, app_type, session_id, provider_id, session_slot);
     }
@@ -218,26 +283,72 @@ impl ProviderLoadBalancer {
     pub async fn active_session_targets(&self) -> Vec<ActiveSessionTarget> {
         let mut inner = self.inner.write().await;
         prune_sticky_sessions(&mut inner);
+        prune_active_request_counters(&mut inner);
+        prune_active_unbound_request_counters(&mut inner);
 
-        let mut grouped: HashMap<(String, String), Vec<String>> = HashMap::new();
+        let mut grouped: HashMap<(String, String), ActiveSessionTarget> = HashMap::new();
         for sticky in inner.sticky_sessions.values() {
             grouped
                 .entry((sticky.app_type.clone(), sticky.provider_id.clone()))
-                .or_default()
+                .or_insert_with(|| ActiveSessionTarget {
+                    app_type: sticky.app_type.clone(),
+                    provider_id: sticky.provider_id.clone(),
+                    active_connections: 0,
+                    session_ids: Vec::new(),
+                })
+                .session_ids
                 .push(sticky.session_id.clone());
         }
 
-        let mut targets: Vec<_> = grouped
-            .into_iter()
-            .map(|((app_type, provider_id), mut session_ids)| {
-                session_ids.sort();
-                ActiveSessionTarget {
-                    app_type,
-                    provider_id,
-                    session_ids,
-                }
-            })
-            .collect();
+        for ((app_type, provider_id), counter) in &inner.active_requests {
+            let count = counter.load(Ordering::Acquire);
+            if count == 0 {
+                continue;
+            }
+            grouped
+                .entry((app_type.clone(), provider_id.clone()))
+                .or_insert_with(|| ActiveSessionTarget {
+                    app_type: app_type.clone(),
+                    provider_id: provider_id.clone(),
+                    active_connections: 0,
+                    session_ids: Vec::new(),
+                })
+                .active_connections = count;
+        }
+
+        let mut active_unbound_requests: HashMap<(String, String), usize> = HashMap::new();
+        for ((app_type, provider_id), counter) in &inner.active_unbound_requests {
+            let count = counter.load(Ordering::Acquire);
+            if count == 0 {
+                continue;
+            }
+            grouped
+                .entry((app_type.clone(), provider_id.clone()))
+                .or_insert_with(|| ActiveSessionTarget {
+                    app_type: app_type.clone(),
+                    provider_id: provider_id.clone(),
+                    active_connections: 0,
+                    session_ids: Vec::new(),
+                });
+            active_unbound_requests.insert((app_type.clone(), provider_id.clone()), count);
+        }
+
+        let mut targets: Vec<_> = grouped.into_values().collect();
+        for target in &mut targets {
+            target.session_ids.sort();
+            let active_unbound_count = active_unbound_requests
+                .get(&(target.app_type.clone(), target.provider_id.clone()))
+                .copied()
+                .unwrap_or(0);
+            target.active_connections = active_connection_count_locked(
+                &inner,
+                &target.app_type,
+                &target.provider_id,
+                target.active_connections,
+                active_unbound_count,
+                target.session_ids.len(),
+            );
+        }
         targets.sort_by(|a, b| {
             a.app_type
                 .cmp(&b.app_type)
@@ -247,17 +358,15 @@ impl ProviderLoadBalancer {
     }
 
     async fn sticky_provider_id(&self, app_type: &str, session_id: &str) -> Option<String> {
-        let key = sticky_key(app_type, session_id);
         let mut inner = self.inner.write().await;
         prune_sticky_sessions(&mut inner);
-        inner.sticky_sessions.get_mut(&key).map(|sticky| {
-            sticky.last_seen = Instant::now();
-            sticky.provider_id.clone()
-        })
+        sticky_provider_id_locked(&mut inner, app_type, session_id)
     }
 
     async fn compact_provider_state(&self, provider_key: &str) {
         let mut inner = self.inner.write().await;
+        prune_active_request_counters(&mut inner);
+        prune_active_unbound_request_counters(&mut inner);
         prune_rpm_window(&mut inner, provider_key);
         prune_sticky_sessions(&mut inner);
     }
@@ -269,6 +378,220 @@ fn provider_load_limits(provider: &Provider) -> ProviderLoadLimits {
         .as_ref()
         .and_then(|meta| meta.load_limits.clone())
         .unwrap_or_default()
+}
+
+fn sticky_provider_id_locked(
+    inner: &mut LoadState,
+    app_type: &str,
+    session_id: &str,
+) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+
+    let key = sticky_key(app_type, session_id);
+    inner.sticky_sessions.get_mut(&key).map(|sticky| {
+        sticky.last_seen = Instant::now();
+        sticky.provider_id.clone()
+    })
+}
+
+fn reorder_with_provider_first(providers: &[Provider], index: usize) -> Vec<Provider> {
+    let mut ordered = Vec::with_capacity(providers.len());
+    ordered.push(providers[index].clone());
+    ordered.extend(
+        providers
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .map(|(_, provider)| provider.clone()),
+    );
+    ordered
+}
+
+fn order_providers_by_load_locked(
+    inner: &mut LoadState,
+    app_type: &str,
+    providers: &[Provider],
+) -> Vec<Provider> {
+    let len = providers.len();
+    let cursor = inner
+        .round_robin_cursors
+        .entry(app_type.to_string())
+        .or_default();
+    let offset = *cursor % len;
+    *cursor = cursor.wrapping_add(1);
+
+    let mut scored: Vec<_> = providers
+        .iter()
+        .enumerate()
+        .map(|(index, provider)| {
+            let score = provider_load_score(inner, app_type, provider);
+            let tie_order = (index + len - offset) % len;
+            (score, tie_order, provider.clone())
+        })
+        .collect();
+
+    scored.sort_by_key(|(score, tie_order, _)| (*score, *tie_order));
+    scored
+        .into_iter()
+        .map(|(_, _, provider)| provider)
+        .collect()
+}
+
+fn provider_load_score(inner: &mut LoadState, app_type: &str, provider: &Provider) -> u64 {
+    let limits = provider_load_limits(provider);
+    let concurrency_score = limits
+        .max_concurrent_limit()
+        .map(|limit| {
+            ratio_score(
+                current_concurrency_usage(inner, app_type, &provider.id),
+                limit,
+            )
+        })
+        .unwrap_or_else(|| {
+            unconstrained_active_score(current_concurrency_usage(inner, app_type, &provider.id))
+        });
+
+    let rpm_score = limits.rpm_limit().map_or(0, |limit| {
+        let key = provider_key(app_type, &provider.id);
+        prune_rpm_window(inner, &key);
+        let used = inner.rpm_windows.get(&key).map_or(0, VecDeque::len);
+        ratio_score(used, limit)
+    });
+
+    concurrency_score.max(rpm_score)
+}
+
+fn active_session_count(inner: &LoadState, app_type: &str, provider_id: &str) -> usize {
+    inner
+        .sticky_sessions
+        .values()
+        .filter(|sticky| sticky.app_type == app_type && sticky.provider_id == provider_id)
+        .count()
+}
+
+fn active_request_count(inner: &LoadState, app_type: &str, provider_id: &str) -> usize {
+    inner
+        .active_requests
+        .get(&(app_type.to_string(), provider_id.to_string()))
+        .map(|counter| counter.load(Ordering::Acquire))
+        .unwrap_or(0)
+}
+
+fn active_unbound_request_count(inner: &LoadState, app_type: &str, provider_id: &str) -> usize {
+    inner
+        .active_unbound_requests
+        .get(&(app_type.to_string(), provider_id.to_string()))
+        .map(|counter| counter.load(Ordering::Acquire))
+        .unwrap_or(0)
+}
+
+fn increment_active_request_locked(
+    inner: &mut LoadState,
+    app_type: &str,
+    provider_id: &str,
+) -> Arc<AtomicUsize> {
+    let key = (app_type.to_string(), provider_id.to_string());
+    let counter = inner
+        .active_requests
+        .entry(key)
+        .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+        .clone();
+    counter.fetch_add(1, Ordering::AcqRel);
+    counter
+}
+
+fn increment_active_unbound_request_locked(
+    inner: &mut LoadState,
+    app_type: &str,
+    provider_id: &str,
+) -> Arc<AtomicUsize> {
+    let key = (app_type.to_string(), provider_id.to_string());
+    let counter = inner
+        .active_unbound_requests
+        .entry(key)
+        .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+        .clone();
+    counter.fetch_add(1, Ordering::AcqRel);
+    counter
+}
+
+fn prune_active_request_counters(inner: &mut LoadState) {
+    inner
+        .active_requests
+        .retain(|_, counter| counter.load(Ordering::Acquire) > 0);
+}
+
+fn prune_active_unbound_request_counters(inner: &mut LoadState) {
+    inner
+        .active_unbound_requests
+        .retain(|_, counter| counter.load(Ordering::Acquire) > 0);
+}
+
+fn decrement_active_request_counter(counter: &AtomicUsize) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        Some(value.saturating_sub(1))
+    });
+}
+
+fn current_concurrency_usage(inner: &LoadState, app_type: &str, provider_id: &str) -> usize {
+    active_connection_count_locked(
+        inner,
+        app_type,
+        provider_id,
+        active_request_count(inner, app_type, provider_id),
+        active_unbound_request_count(inner, app_type, provider_id),
+        active_session_count(inner, app_type, provider_id),
+    )
+}
+
+fn active_connection_count_locked(
+    inner: &LoadState,
+    app_type: &str,
+    provider_id: &str,
+    active_requests: usize,
+    active_unbound_requests: usize,
+    active_sessions: usize,
+) -> usize {
+    let active_sticky_requests = active_requests.saturating_sub(active_unbound_requests);
+    let logical_usage = active_sessions
+        .max(active_sticky_requests)
+        .saturating_add(active_unbound_requests);
+
+    semaphore_concurrency_usage(inner, app_type, provider_id).max(logical_usage)
+}
+
+fn semaphore_concurrency_usage(inner: &LoadState, app_type: &str, provider_id: &str) -> usize {
+    let key_prefix = format!("{}:concurrency:", provider_key(app_type, provider_id));
+    inner
+        .semaphores
+        .iter()
+        .filter(|(key, _)| key.starts_with(&key_prefix))
+        .map(|(key, semaphore)| {
+            concurrency_limit_from_semaphore_key(key)
+                .map(|limit| limit.saturating_sub(semaphore.available_permits()))
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+fn concurrency_limit_from_semaphore_key(key: &str) -> Option<usize> {
+    key.rsplit_once(":concurrency:")?.1.parse().ok()
+}
+
+fn ratio_score(used: usize, limit: usize) -> u64 {
+    if limit == 0 {
+        return 0;
+    }
+    (used as u64).saturating_mul(LOAD_SCORE_SCALE) / limit as u64
+}
+
+fn unconstrained_active_score(active_sessions: usize) -> u64 {
+    if active_sessions == 0 {
+        return 0;
+    }
+    (active_sessions as u64).saturating_mul(LOAD_SCORE_SCALE) / (active_sessions as u64 + 1)
 }
 
 fn check_and_reserve_rpm(
@@ -419,10 +742,55 @@ mod tests {
         assert!(balancer.acquire("claude", "s1", &p).await.is_ok());
 
         drop(first);
-        tokio::task::yield_now().await;
         assert_eq!(
             balancer
                 .acquire("claude", "s2", &p)
+                .await
+                .err()
+                .unwrap()
+                .reason,
+            ProviderLoadRejectReason::ConcurrencyFull
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_respects_concurrency_limit_without_session_id() {
+        let balancer = ProviderLoadBalancer::default();
+        let p = provider("p1", Some(1), None);
+
+        let first = balancer.acquire("claude", "", &p).await.unwrap();
+
+        assert_eq!(
+            balancer
+                .acquire("claude", "", &p)
+                .await
+                .err()
+                .unwrap()
+                .reason,
+            ProviderLoadRejectReason::ConcurrencyFull
+        );
+
+        drop(first);
+        assert!(balancer.acquire("claude", "", &p).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn acquire_respects_lowered_concurrency_limit() {
+        let balancer = ProviderLoadBalancer::default();
+        let p_limit_two = provider("p1", Some(2), None);
+        let p_limit_one = provider("p1", Some(1), None);
+
+        let mut first = balancer
+            .acquire("claude", "s1", &p_limit_two)
+            .await
+            .unwrap();
+        balancer
+            .bind_success("claude", "s1", &p_limit_two.id, &mut first)
+            .await;
+
+        assert_eq!(
+            balancer
+                .acquire("claude", "s2", &p_limit_one)
                 .await
                 .err()
                 .unwrap()
@@ -440,6 +808,28 @@ mod tests {
         assert_eq!(
             balancer
                 .acquire("claude", "s2", &p)
+                .await
+                .err()
+                .unwrap()
+                .reason,
+            ProviderLoadRejectReason::RpmFull
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_session_respects_rpm_limit() {
+        let balancer = ProviderLoadBalancer::default();
+        let p = provider("p1", None, Some(1));
+
+        let mut first = balancer.acquire("claude", "s1", &p).await.unwrap();
+        balancer
+            .bind_success("claude", "s1", &p.id, &mut first)
+            .await;
+        drop(first);
+
+        assert_eq!(
+            balancer
+                .acquire("claude", "s1", &p)
                 .await
                 .err()
                 .unwrap()
@@ -477,6 +867,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_session_prefers_less_loaded_provider_when_limits_exist() {
+        let balancer = ProviderLoadBalancer::default();
+        let p1 = provider("p1", Some(2), None);
+        let p2 = provider("p2", Some(2), None);
+
+        let mut permit = balancer.acquire("claude", "s1", &p1).await.unwrap();
+        balancer
+            .bind_success("claude", "s1", &p1.id, &mut permit)
+            .await;
+
+        let ordered = balancer
+            .order_providers_for_session("claude", "s2", &[p1.clone(), p2.clone()])
+            .await;
+
+        assert_eq!(ordered[0].id, "p2");
+        assert_eq!(ordered[1].id, "p1");
+    }
+
+    #[tokio::test]
+    async fn new_session_accounts_for_unbound_requests_without_concurrency_limit() {
+        let balancer = ProviderLoadBalancer::default();
+        let p1 = provider("p1", None, None);
+        let p2 = provider("p2", None, Some(60));
+
+        let unbound = balancer.acquire("claude", "", &p1).await.unwrap();
+
+        let ordered = balancer
+            .order_providers_for_session("claude", "s2", &[p1.clone(), p2.clone()])
+            .await;
+
+        assert_eq!(ordered[0].id, "p2");
+        assert_eq!(ordered[1].id, "p1");
+
+        drop(unbound);
+    }
+
+    #[tokio::test]
+    async fn new_session_order_rotates_when_limited_providers_have_equal_load() {
+        let balancer = ProviderLoadBalancer::default();
+        let p1 = provider("p1", Some(2), None);
+        let p2 = provider("p2", Some(2), None);
+
+        let first = balancer
+            .order_providers_for_session("claude", "s1", &[p1.clone(), p2.clone()])
+            .await;
+        let second = balancer
+            .order_providers_for_session("claude", "s2", &[p1.clone(), p2.clone()])
+            .await;
+
+        assert_eq!(first[0].id, "p1");
+        assert_eq!(second[0].id, "p2");
+    }
+
+    #[tokio::test]
+    async fn new_session_keeps_queue_order_without_load_limits() {
+        let balancer = ProviderLoadBalancer::default();
+        let p1 = provider("p1", None, None);
+        let p2 = provider("p2", None, None);
+
+        let mut permit = balancer.acquire("claude", "s1", &p1).await.unwrap();
+        balancer
+            .bind_success("claude", "s1", &p1.id, &mut permit)
+            .await;
+
+        let ordered = balancer
+            .order_providers_for_session("claude", "s2", &[p1.clone(), p2.clone()])
+            .await;
+
+        assert_eq!(ordered[0].id, "p1");
+        assert_eq!(ordered[1].id, "p2");
+    }
+
+    #[tokio::test]
     async fn active_session_targets_group_by_app_and_provider() {
         let balancer = ProviderLoadBalancer::default();
         let p1 = provider("p1", None, None);
@@ -501,14 +964,112 @@ mod tests {
                 ActiveSessionTarget {
                     app_type: "claude".to_string(),
                     provider_id: "p2".to_string(),
+                    active_connections: 2,
                     session_ids: vec!["s1".to_string(), "s2".to_string()],
                 },
                 ActiveSessionTarget {
                     app_type: "codex".to_string(),
                     provider_id: "p1".to_string(),
+                    active_connections: 1,
                     session_ids: vec!["thread-1".to_string()],
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn active_session_targets_include_unbound_active_requests() {
+        let balancer = ProviderLoadBalancer::default();
+        let p1 = provider("p1", Some(2), None);
+
+        let permit = balancer.acquire("claude", "", &p1).await.unwrap();
+
+        assert_eq!(
+            balancer.active_session_targets().await,
+            vec![ActiveSessionTarget {
+                app_type: "claude".to_string(),
+                provider_id: "p1".to_string(),
+                active_connections: 1,
+                session_ids: Vec::new(),
+            }]
+        );
+
+        drop(permit);
+        assert!(balancer.active_session_targets().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_session_targets_count_sticky_slots_and_unbound_requests() {
+        let balancer = ProviderLoadBalancer::default();
+        let p1 = provider("p1", Some(3), None);
+
+        let mut sticky = balancer.acquire("claude", "s1", &p1).await.unwrap();
+        balancer
+            .bind_success("claude", "s1", &p1.id, &mut sticky)
+            .await;
+        drop(sticky);
+
+        let unbound = balancer.acquire("claude", "", &p1).await.unwrap();
+
+        assert_eq!(
+            balancer.active_session_targets().await,
+            vec![ActiveSessionTarget {
+                app_type: "claude".to_string(),
+                provider_id: "p1".to_string(),
+                active_connections: 2,
+                session_ids: vec!["s1".to_string()],
+            }]
+        );
+
+        drop(unbound);
+    }
+
+    #[tokio::test]
+    async fn active_session_targets_do_not_double_count_newly_bound_request() {
+        let balancer = ProviderLoadBalancer::default();
+        let p1 = provider("p1", None, None);
+
+        let mut request = balancer.acquire("claude", "s1", &p1).await.unwrap();
+        balancer
+            .bind_success("claude", "s1", &p1.id, &mut request)
+            .await;
+
+        assert_eq!(
+            balancer.active_session_targets().await,
+            vec![ActiveSessionTarget {
+                app_type: "claude".to_string(),
+                provider_id: "p1".to_string(),
+                active_connections: 1,
+                session_ids: vec!["s1".to_string()],
+            }]
+        );
+
+        drop(request);
+    }
+
+    #[tokio::test]
+    async fn active_session_targets_count_sticky_slots_and_unbound_requests_without_limit() {
+        let balancer = ProviderLoadBalancer::default();
+        let p1 = provider("p1", None, None);
+
+        let mut sticky = balancer.acquire("claude", "s1", &p1).await.unwrap();
+        balancer
+            .bind_success("claude", "s1", &p1.id, &mut sticky)
+            .await;
+        drop(sticky);
+
+        let unbound = balancer.acquire("claude", "", &p1).await.unwrap();
+
+        assert_eq!(
+            balancer.active_session_targets().await,
+            vec![ActiveSessionTarget {
+                app_type: "claude".to_string(),
+                provider_id: "p1".to_string(),
+                active_connections: 2,
+                session_ids: vec!["s1".to_string()],
+            }]
+        );
+
+        drop(unbound);
     }
 }
