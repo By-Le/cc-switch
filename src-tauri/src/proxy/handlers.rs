@@ -26,7 +26,7 @@ use super::{
     response_processor::{
         create_logged_passthrough_stream, process_response, read_decoded_body,
         strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
-        usage_logging_enabled, SseUsageCollector,
+        usage_logging_enabled, SseUsageCollector, StreamFailureTracker,
     },
     server::ProxyState,
     sse::{strip_sse_field, take_sse_block},
@@ -381,6 +381,16 @@ async fn handle_claude_transform(
             sse_stream,
             "Claude/OpenRouter",
             usage_collector,
+            ctx.session_client_provided
+                .then(|| {
+                    StreamFailureTracker::from_session_failure(
+                        state.load_balancer.clone(),
+                        ctx.app_type_str.to_string(),
+                        ctx.session_id.clone(),
+                        ctx.provider.id.clone(),
+                    )
+                })
+                .flatten(),
             timeout_config,
             connection_guard,
         );
@@ -798,6 +808,16 @@ async fn handle_codex_chat_to_responses_transform(
             sse_stream,
             ctx.tag,
             usage_collector,
+            ctx.session_client_provided
+                .then(|| {
+                    StreamFailureTracker::from_session_failure(
+                        state.load_balancer.clone(),
+                        ctx.app_type_str.to_string(),
+                        ctx.session_id.clone(),
+                        ctx.provider.id.clone(),
+                    )
+                })
+                .flatten(),
             ctx.streaming_timeout_config(),
             connection_guard,
         );

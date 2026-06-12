@@ -274,6 +274,14 @@ impl RequestForwarder {
         }
     }
 
+    async fn record_provider_session_failure(&self, app_type_str: &str, provider_id: &str) {
+        if self.session_client_provided {
+            self.load_balancer
+                .record_failure(app_type_str, &self.session_id, provider_id)
+                .await;
+        }
+    }
+
     async fn finalize_provider_success(
         &self,
         app_type_str: &str,
@@ -358,6 +366,8 @@ impl RequestForwarder {
                     false,
                     Some(retry_err.to_string()),
                 )
+                .await;
+            self.record_provider_session_failure(app_type_str, &provider.id)
                 .await;
             {
                 let mut status = self.status.write().await;
@@ -979,6 +989,8 @@ impl RequestForwarder {
                                     false,
                                     Some(e.to_string()),
                                 )
+                                .await;
+                            self.record_provider_session_failure(app_type_str, &provider.id)
                                 .await;
 
                             {
@@ -2740,7 +2752,9 @@ mod tests {
 
     #[test]
     fn load_distribution_success_does_not_update_active_target() {
-        assert!(!should_update_active_target_after_success("p1", "p2", false));
+        assert!(!should_update_active_target_after_success(
+            "p1", "p2", false
+        ));
         assert!(should_update_active_target_after_success("p1", "p1", false));
         assert!(should_update_active_target_after_success("p1", "p2", true));
         assert!(should_update_active_target_after_success("", "p2", false));

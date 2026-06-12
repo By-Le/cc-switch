@@ -17,6 +17,7 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 const RPM_WINDOW: Duration = Duration::from_secs(60);
+const SESSION_FAILURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const LOAD_SCORE_SCALE: u64 = 1_000_000;
 
 #[derive(Clone, Default)]
@@ -29,6 +30,7 @@ struct LoadState {
     semaphores: HashMap<String, Arc<Semaphore>>,
     rpm_windows: HashMap<String, VecDeque<Instant>>,
     sticky_sessions: HashMap<String, StickyProvider>,
+    session_failures: HashMap<String, HashMap<String, Instant>>,
     active_requests: HashMap<(String, String), Arc<AtomicUsize>>,
     active_unbound_requests: HashMap<(String, String), Arc<AtomicUsize>>,
     round_robin_cursors: HashMap<String, usize>,
@@ -107,15 +109,22 @@ impl ProviderLoadBalancer {
 
         let mut inner = self.inner.write().await;
         prune_sticky_sessions(&mut inner);
+        prune_session_failures(&mut inner);
+        let failed_provider_ids = failed_provider_ids_locked(&inner, app_type, session_id);
 
         if let Some(sticky_provider_id) =
             sticky_provider_id_locked(&mut inner, app_type, session_id)
         {
-            if let Some(index) = providers
+            if !failed_provider_ids
                 .iter()
-                .position(|provider| provider.id == sticky_provider_id)
+                .any(|provider_id| provider_id == &sticky_provider_id)
             {
-                return reorder_with_provider_first(providers, index);
+                if let Some(index) = providers
+                    .iter()
+                    .position(|provider| provider.id == sticky_provider_id)
+                {
+                    return reorder_with_provider_first(providers, index);
+                }
             }
         }
 
@@ -123,10 +132,11 @@ impl ProviderLoadBalancer {
             .iter()
             .any(|provider| provider_load_limits(provider).has_limits())
         {
-            return providers.to_vec();
+            return move_failed_providers_to_end(providers, &failed_provider_ids);
         }
 
-        order_providers_by_load_locked(&mut inner, app_type, providers)
+        let ordered = order_providers_by_load_locked(&mut inner, app_type, providers);
+        move_failed_providers_to_end(&ordered, &failed_provider_ids)
     }
 
     pub async fn acquire(
@@ -269,6 +279,31 @@ impl ProviderLoadBalancer {
         bind_session_locked(&mut inner, app_type, session_id, provider_id, session_slot);
     }
 
+    pub async fn record_failure(&self, app_type: &str, session_id: &str, provider_id: &str) {
+        if session_id.trim().is_empty() {
+            return;
+        }
+
+        let mut inner = self.inner.write().await;
+        prune_sticky_sessions(&mut inner);
+        prune_session_failures(&mut inner);
+
+        let key = sticky_key(app_type, session_id);
+        if inner
+            .sticky_sessions
+            .get(&key)
+            .is_some_and(|sticky| sticky.provider_id == provider_id)
+        {
+            inner.sticky_sessions.remove(&key);
+        }
+
+        inner
+            .session_failures
+            .entry(key)
+            .or_default()
+            .insert(provider_id.to_string(), Instant::now());
+    }
+
     pub async fn is_session_bound_to_provider(
         &self,
         app_type: &str,
@@ -369,6 +404,7 @@ impl ProviderLoadBalancer {
         prune_active_unbound_request_counters(&mut inner);
         prune_rpm_window(&mut inner, provider_key);
         prune_sticky_sessions(&mut inner);
+        prune_session_failures(&mut inner);
     }
 }
 
@@ -396,6 +432,18 @@ fn sticky_provider_id_locked(
     })
 }
 
+fn failed_provider_ids_locked(inner: &LoadState, app_type: &str, session_id: &str) -> Vec<String> {
+    if session_id.trim().is_empty() {
+        return Vec::new();
+    }
+
+    inner
+        .session_failures
+        .get(&sticky_key(app_type, session_id))
+        .map(|failures| failures.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 fn reorder_with_provider_first(providers: &[Provider], index: usize) -> Vec<Provider> {
     let mut ordered = Vec::with_capacity(providers.len());
     ordered.push(providers[index].clone());
@@ -407,6 +455,36 @@ fn reorder_with_provider_first(providers: &[Provider], index: usize) -> Vec<Prov
             .map(|(_, provider)| provider.clone()),
     );
     ordered
+}
+
+fn move_failed_providers_to_end(
+    providers: &[Provider],
+    failed_provider_ids: &[String],
+) -> Vec<Provider> {
+    if failed_provider_ids.is_empty() {
+        return providers.to_vec();
+    }
+
+    let mut available = Vec::with_capacity(providers.len());
+    let mut failed = Vec::new();
+
+    for provider in providers {
+        if failed_provider_ids
+            .iter()
+            .any(|provider_id| provider_id == &provider.id)
+        {
+            failed.push(provider.clone());
+        } else {
+            available.push(provider.clone());
+        }
+    }
+
+    if available.is_empty() {
+        return providers.to_vec();
+    }
+
+    available.extend(failed);
+    available
 }
 
 fn order_providers_by_load_locked(
@@ -649,8 +727,10 @@ fn bind_session_locked(
     session_slot: Option<OwnedSemaphorePermit>,
 ) {
     prune_sticky_sessions(inner);
+    prune_session_failures(inner);
     let key = sticky_key(app_type, session_id);
     let now = Instant::now();
+    inner.session_failures.remove(&key);
 
     if let Some(sticky) = inner.sticky_sessions.get_mut(&key) {
         if sticky.provider_id == provider_id && session_slot.is_none() {
@@ -677,6 +757,14 @@ fn prune_sticky_sessions(inner: &mut LoadState) {
     inner
         .sticky_sessions
         .retain(|_, sticky| now.duration_since(sticky.last_seen) < Duration::from_secs(60 * 60));
+}
+
+fn prune_session_failures(inner: &mut LoadState) {
+    let now = Instant::now();
+    inner.session_failures.retain(|_, failures| {
+        failures.retain(|_, failed_at| now.duration_since(*failed_at) < SESSION_FAILURE_COOLDOWN);
+        !failures.is_empty()
+    });
 }
 
 fn sticky_key(app_type: &str, session_id: &str) -> String {
@@ -864,6 +952,52 @@ mod tests {
                 .is_session_bound_to_provider("claude", "session", &p1.id)
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn failed_sticky_session_uses_next_provider_on_next_request() {
+        let balancer = ProviderLoadBalancer::default();
+        let p1 = provider("p1", None, None);
+        let p2 = provider("p2", None, None);
+
+        let mut permit = balancer.acquire("claude", "session", &p1).await.unwrap();
+        balancer
+            .bind_success("claude", "session", &p1.id, &mut permit)
+            .await;
+
+        balancer.record_failure("claude", "session", &p1.id).await;
+
+        let ordered = balancer
+            .order_providers_for_session("claude", "session", &[p1.clone(), p2.clone()])
+            .await;
+
+        assert_eq!(ordered[0].id, "p2");
+        assert_eq!(ordered[1].id, "p1");
+        assert!(
+            !balancer
+                .is_session_bound_to_provider("claude", "session", &p1.id)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_rebind_clears_session_failure_avoidance() {
+        let balancer = ProviderLoadBalancer::default();
+        let p1 = provider("p1", None, None);
+        let p2 = provider("p2", None, None);
+
+        balancer.record_failure("claude", "session", &p1.id).await;
+        let mut permit = balancer.acquire("claude", "session", &p1).await.unwrap();
+        balancer
+            .bind_success("claude", "session", &p1.id, &mut permit)
+            .await;
+
+        let ordered = balancer
+            .order_providers_for_session("claude", "session", &[p1.clone(), p2.clone()])
+            .await;
+
+        assert_eq!(ordered[0].id, "p1");
+        assert_eq!(ordered[1].id, "p2");
     }
 
     #[tokio::test]

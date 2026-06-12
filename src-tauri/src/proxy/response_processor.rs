@@ -13,6 +13,7 @@ use super::{
     ProxyError,
 };
 use crate::database::PRICING_SOURCE_REQUEST;
+use crate::proxy::load_balancer::ProviderLoadBalancer;
 use axum::http::{header::HeaderMap, HeaderName};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -216,6 +217,17 @@ pub async fn handle_streaming(
 
     // 创建使用量收集器；关闭 usage logging 时不要在流式热路径上解析每个 SSE event。
     let usage_collector = create_usage_collector(ctx, state, status.as_u16(), parser_config);
+    let failure_tracker = ctx
+        .session_client_provided
+        .then(|| {
+            StreamFailureTracker::from_session_failure(
+                state.load_balancer.clone(),
+                ctx.app_type_str.to_string(),
+                ctx.session_id.clone(),
+                ctx.provider.id.clone(),
+            )
+        })
+        .flatten();
 
     // 获取流式超时配置
     let timeout_config = ctx.streaming_timeout_config();
@@ -225,6 +237,7 @@ pub async fn handle_streaming(
         stream,
         ctx.tag,
         usage_collector,
+        failure_tracker,
         timeout_config,
         connection_guard,
     );
@@ -363,6 +376,7 @@ pub async fn process_response(
 // ============================================================================
 
 type UsageCallbackWithTiming = Arc<dyn Fn(Vec<Value>, Option<u64>) + Send + Sync + 'static>;
+type StreamFailureCallback = Arc<dyn Fn(String) + Send + Sync + 'static>;
 
 /// SSE 使用量收集器
 #[derive(Clone)]
@@ -474,6 +488,61 @@ impl Drop for SseUsageFinishGuard {
                 log::warn!("SSE 用量收尾保护触发时 Tokio runtime 不可用，跳过异步 finish");
             }
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct StreamFailureTracker {
+    inner: Arc<StreamFailureTrackerInner>,
+}
+
+struct StreamFailureTrackerInner {
+    callback: StreamFailureCallback,
+    finished: AtomicBool,
+}
+
+impl StreamFailureTracker {
+    pub fn new(callback: impl Fn(String) + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Arc::new(StreamFailureTrackerInner {
+                callback: Arc::new(callback),
+                finished: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    pub fn from_session_failure(
+        load_balancer: ProviderLoadBalancer,
+        app_type: String,
+        session_id: String,
+        provider_id: String,
+    ) -> Option<Self> {
+        if session_id.trim().is_empty() {
+            return None;
+        }
+
+        Some(Self::new(move |reason| {
+            let load_balancer = load_balancer.clone();
+            let app_type = app_type.clone();
+            let session_id = session_id.clone();
+            let provider_id = provider_id.clone();
+            tokio::spawn(async move {
+                log::warn!(
+                    "[{app_type}] 流式响应失败，临时避让会话 provider: session={session_id}, provider={provider_id}, reason={reason}"
+                );
+                load_balancer
+                    .record_failure(&app_type, &session_id, &provider_id)
+                    .await;
+            });
+        }))
+    }
+
+    async fn record_failure(&self, reason: String) {
+        if self.inner.finished.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        (self.inner.callback)(reason);
     }
 }
 
@@ -679,6 +748,7 @@ pub fn create_logged_passthrough_stream(
     stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     tag: &'static str,
     usage_collector: Option<SseUsageCollector>,
+    failure_tracker: Option<StreamFailureTracker>,
     timeout_config: StreamingTimeoutConfig,
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
@@ -687,9 +757,10 @@ pub fn create_logged_passthrough_stream(
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut collector = usage_collector;
+        let failure_tracker = failure_tracker;
         let mut finish_guard = collector.clone().map(SseUsageFinishGuard::new);
         let inspect_sse_events =
-            collector.is_some() || log::log_enabled!(log::Level::Debug);
+            collector.is_some() || failure_tracker.is_some() || log::log_enabled!(log::Level::Debug);
         let mut is_first_chunk = true;
 
         // 超时配置
@@ -723,6 +794,14 @@ pub fn create_logged_passthrough_stream(
                             // 超时
                             let timeout_type = if is_first_chunk { "首字节" } else { "静默期" };
                             log::error!("[{tag}] 流式响应{}超时 ({}秒)", timeout_type, duration.as_secs());
+                            if let Some(tracker) = &failure_tracker {
+                                tracker
+                                    .record_failure(format!(
+                                        "流式响应{timeout_type}超时: {}s",
+                                        duration.as_secs()
+                                    ))
+                                    .await;
+                            }
                             yield Err(std::io::Error::other(format!("流式响应{timeout_type}超时")));
                             break;
                         }
@@ -767,6 +846,16 @@ pub fn create_logged_passthrough_stream(
                                             } else {
                                                 log::debug!("[{tag}] <<< SSE 数据: {data}");
                                             }
+                                            if let Some(tracker) = &failure_tracker {
+                                                if is_provider_stream_failure_event(data) {
+                                                    tracker
+                                                        .record_failure(
+                                                            extract_stream_failure_reason(data)
+                                                                .unwrap_or_else(|| "provider stream_error event".to_string()),
+                                                        )
+                                                        .await;
+                                                }
+                                            }
                                         } else {
                                             log::debug!("[{tag}] <<< SSE: [DONE]");
                                         }
@@ -780,6 +869,9 @@ pub fn create_logged_passthrough_stream(
                 }
                 Some(Err(e)) => {
                     log::error!("[{tag}] 流错误: {e}");
+                    if let Some(tracker) = &failure_tracker {
+                        tracker.record_failure(format!("流错误: {e}")).await;
+                    }
                     yield Err(std::io::Error::other(e.to_string()));
                     break;
                 }
@@ -797,6 +889,35 @@ pub fn create_logged_passthrough_stream(
             guard.disarm();
         }
     }
+}
+
+fn is_provider_stream_failure_event(data: &str) -> bool {
+    serde_json::from_str::<Value>(data)
+        .ok()
+        .as_ref()
+        .and_then(stream_failure_type)
+        .is_some_and(|error_type| error_type == "stream_error")
+}
+
+fn extract_stream_failure_reason(data: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(data).ok()?;
+    stream_failure_message(&value).or_else(|| stream_failure_type(&value).map(ToString::to_string))
+}
+
+fn stream_failure_type(value: &Value) -> Option<&str> {
+    value
+        .pointer("/error/type")
+        .or_else(|| value.pointer("/response/error/type"))
+        .and_then(Value::as_str)
+}
+
+fn stream_failure_message(value: &Value) -> Option<String> {
+    value
+        .pointer("/error/message")
+        .or_else(|| value.pointer("/response/error/message"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.is_empty())
+        .map(ToString::to_string)
 }
 
 fn format_headers(headers: &HeaderMap) -> String {
@@ -930,6 +1051,31 @@ mod tests {
         assert_eq!(
             headers.get(axum::http::header::CONTENT_TYPE),
             Some(&axum::http::HeaderValue::from_static("text/event-stream"))
+        );
+    }
+
+    #[test]
+    fn stream_failure_detector_only_matches_transport_errors() {
+        assert!(is_provider_stream_failure_event(
+            r#"{"type":"error","error":{"type":"stream_error","message":"Stream error: reset"}}"#
+        ));
+        assert!(is_provider_stream_failure_event(
+            r#"{"type":"response.failed","response":{"error":{"type":"stream_error","message":"Stream error: reset"}}}"#
+        ));
+        assert!(!is_provider_stream_failure_event(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}"#
+        ));
+        assert!(!is_provider_stream_failure_event("[DONE]"));
+    }
+
+    #[test]
+    fn stream_failure_reason_prefers_message() {
+        assert_eq!(
+            extract_stream_failure_reason(
+                r#"{"type":"response.failed","response":{"error":{"type":"stream_error","message":"connection lost"}}}"#
+            )
+            .as_deref(),
+            Some("connection lost")
         );
     }
 
