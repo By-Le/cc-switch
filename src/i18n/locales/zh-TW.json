@@ -2235,7 +2235,9 @@
     "title": "Agent"
   },
   "modelTest": {
-    "testProvider": "測試模型"
+    "testProvider": "測試模型",
+    "testing": "正在測試模型",
+    "unavailable": "目前供應商不支援模型測試"
   },
   "health": {
     "operational": "正常",
@@ -2463,7 +2465,16 @@
     "degraded": "{{providerName}} 回應較慢 ({{responseTimeMs}}ms)",
     "failed": "{{providerName}} 檢查失敗：{{message}}",
     "rejected": "{{providerName}} 檢查被拒：{{message}}",
+    "temporary": "{{providerName}} 暫時不可用：{{message}}",
     "error": "{{providerName}} 檢查出錯：{{error}}",
+    "lastStatusOperational": "測試通過",
+    "lastStatusDegraded": "回應偏慢",
+    "lastStatusFailed": "測試失敗",
+    "lastModel": "模型 {{model}}",
+    "lastLatency": "{{latency}}ms",
+    "lastHttpStatus": "HTTP {{status}}",
+    "lastRetryCount": "重試 {{count}} 次",
+    "lastTestedAt": "測試於 {{time}}",
     "modelNotFound": "{{providerName}} 測試模型 {{model}} 不存在或已下架",
     "modelNotFoundHint": "該模型可能已被供應商棄用。請在「模型測試設定」中更新預設測試模型。",
     "quotaExceeded": "{{providerName}} Coding Plan 額度已用盡",

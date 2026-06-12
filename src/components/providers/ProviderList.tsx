@@ -20,6 +20,7 @@ import { toast } from "sonner";
 import type { Provider } from "@/types";
 import type { ActiveTarget } from "@/types/proxy";
 import type { AppId } from "@/lib/api";
+import type { ProviderStreamCheckResult } from "@/lib/api/model-test";
 import { providersApi } from "@/lib/api/providers";
 import { useDragSort } from "@/hooks/useDragSort";
 import {
@@ -104,7 +105,7 @@ export function ProviderList({
   onSetAsDefault,
 }: ProviderListProps) {
   const { t } = useTranslation();
-  const { checkProvider, isChecking } = useStreamCheck(appId);
+  const { checkProvider, isChecking, lastResults = {} } = useStreamCheck(appId);
   const { sortedProviders, sensors, handleDragEnd } = useDragSort(
     providers,
     appId,
@@ -492,6 +493,7 @@ export function ProviderList({
                 onOpenTerminal={onOpenTerminal}
                 onTest={handleTest}
                 isTesting={isChecking(provider.id)}
+                lastTestResult={lastResults[provider.id]}
                 isProxyRunning={isProxyRunning}
                 isProxyTakeover={isProxyTakeover}
                 isAutoFailoverEnabled={isFailoverModeActive}
@@ -719,6 +721,7 @@ interface SortableProviderCardProps {
   onOpenTerminal?: (provider: Provider) => void;
   onTest?: (provider: Provider) => void;
   isTesting: boolean;
+  lastTestResult?: ProviderStreamCheckResult;
   isProxyRunning: boolean;
   isProxyTakeover: boolean;
   isAutoFailoverEnabled: boolean;
@@ -752,6 +755,7 @@ function SortableProviderCard({
   onOpenTerminal,
   onTest,
   isTesting,
+  lastTestResult,
   isProxyRunning,
   isProxyTakeover,
   isAutoFailoverEnabled,
@@ -801,6 +805,7 @@ function SortableProviderCard({
         onOpenTerminal={onOpenTerminal}
         onTest={onTest}
         isTesting={isTesting}
+        lastTestResult={lastTestResult}
         isProxyRunning={isProxyRunning}
         isProxyTakeover={isProxyTakeover}
         dragHandleProps={{

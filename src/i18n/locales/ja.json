@@ -2290,7 +2290,9 @@
     "title": "エージェント"
   },
   "modelTest": {
-    "testProvider": "モデルテスト"
+    "testProvider": "モデルテスト",
+    "testing": "モデルをテスト中",
+    "unavailable": "このプロバイダーはモデルテストに対応していません"
   },
   "health": {
     "operational": "正常",
@@ -2518,7 +2520,16 @@
     "degraded": "{{providerName}} の応答が遅いです ({{responseTimeMs}}ms)",
     "failed": "{{providerName}} のチェックに失敗しました: {{message}}",
     "rejected": "{{providerName}} のチェックが拒否されました: {{message}}",
+    "temporary": "{{providerName}} は一時的に利用できません: {{message}}",
     "error": "{{providerName}} のチェックでエラーが発生しました: {{error}}",
+    "lastStatusOperational": "テスト成功",
+    "lastStatusDegraded": "応答が遅い",
+    "lastStatusFailed": "テスト失敗",
+    "lastModel": "モデル {{model}}",
+    "lastLatency": "{{latency}}ms",
+    "lastHttpStatus": "HTTP {{status}}",
+    "lastRetryCount": "{{count}} 回リトライ",
+    "lastTestedAt": "{{time}} にテスト",
     "modelNotFound": "{{providerName}} のテストモデル {{model}} は存在しないか廃止されています",
     "modelNotFoundHint": "このモデルはプロバイダーにより廃止された可能性があります。「モデルテスト設定」でデフォルトのテストモデルを更新してください。",
     "quotaExceeded": "{{providerName}} の Coding Plan 利用枠を超過しました",

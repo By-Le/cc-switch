@@ -10,6 +10,7 @@ const useSortableMock = vi.fn();
 const providerCardRenderSpy = vi.fn();
 let autoFailoverEnabled = false;
 let failoverQueue: Array<{ providerId: string; providerName: string }> = [];
+let lastStreamCheckResults: Record<string, unknown> = {};
 
 vi.mock("@/hooks/useDragSort", () => ({
   useDragSort: (...args: unknown[]) => useDragSortMock(...args),
@@ -97,6 +98,7 @@ vi.mock("@/hooks/useStreamCheck", () => ({
   useStreamCheck: () => ({
     checkProvider: vi.fn(),
     isChecking: () => false,
+    lastResults: lastStreamCheckResults,
   }),
 }));
 
@@ -152,6 +154,7 @@ beforeEach(() => {
   });
   autoFailoverEnabled = false;
   failoverQueue = [];
+  lastStreamCheckResults = {};
 });
 
 describe("ProviderList Component", () => {
@@ -437,5 +440,43 @@ describe("ProviderList Component", () => {
     expect(screen.getByText("活跃会话")).toBeInTheDocument();
     expect(screen.getByText("session-a")).toBeInTheDocument();
     expect(screen.getByText("session-b")).toBeInTheDocument();
+  });
+
+  it("passes the latest stream check result to provider cards", () => {
+    const providerA = createProvider({ id: "a", name: "A" });
+    const latestResult = {
+      providerId: "a",
+      status: "operational",
+      success: true,
+      message: "ok",
+      responseTimeMs: 320,
+      modelUsed: "claude-test-model",
+      testedAt: 1_700_000_000,
+      retryCount: 0,
+    };
+
+    lastStreamCheckResults = { a: latestResult };
+    useDragSortMock.mockReturnValue({
+      sortedProviders: [providerA],
+      sensors: [],
+      handleDragEnd: vi.fn(),
+    });
+
+    renderWithQueryClient(
+      <ProviderList
+        providers={{ a: providerA }}
+        currentProviderId=""
+        appId="claude"
+        onSwitch={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onDuplicate={vi.fn()}
+        onOpenWebsite={vi.fn()}
+      />,
+    );
+
+    expect(providerCardRenderSpy.mock.calls[0][0].lastTestResult).toBe(
+      latestResult,
+    );
   });
 });

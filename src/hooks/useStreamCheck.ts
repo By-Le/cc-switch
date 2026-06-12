@@ -3,14 +3,20 @@ import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import {
   streamCheckProvider,
+  type ProviderStreamCheckResult,
   type StreamCheckResult,
 } from "@/lib/api/model-test";
 import type { AppId } from "@/lib/api";
 import { useResetCircuitBreaker } from "@/lib/query/failover";
 
+export type LastStreamCheckResult = ProviderStreamCheckResult;
+
 export function useStreamCheck(appId: AppId) {
   const { t } = useTranslation();
   const [checkingIds, setCheckingIds] = useState<Set<string>>(new Set());
+  const [lastResults, setLastResults] = useState<
+    Record<string, LastStreamCheckResult>
+  >({});
   const resetCircuitBreaker = useResetCircuitBreaker();
 
   const checkProvider = useCallback(
@@ -22,6 +28,10 @@ export function useStreamCheck(appId: AppId) {
 
       try {
         const result = await streamCheckProvider(appId, providerId);
+        setLastResults((prev) => ({
+          ...prev,
+          [providerId]: { ...result, providerId },
+        }));
 
         if (result.status === "operational") {
           toast.success(
@@ -84,12 +94,22 @@ export function useStreamCheck(appId: AppId) {
           const description =
             (hintKey ? t(hintKey, { defaultValue: "" }) : "") || undefined;
 
-          // 401/403/400 = 检查被拒（供应商可能正常）；429/5xx = 临时问题
+          const isTemporaryIssue =
+            httpStatus != null && (httpStatus === 429 || httpStatus >= 500);
+          // 401/403/400 = 检查被拒（供应商可能正常）
           const isProbeRejection =
-            httpStatus != null &&
-            ([401, 403, 400, 429].includes(httpStatus) || httpStatus >= 500);
+            httpStatus != null && [401, 403, 400].includes(httpStatus);
 
-          if (isProbeRejection) {
+          if (isTemporaryIssue) {
+            toast.warning(
+              t("streamCheck.temporary", {
+                providerName: providerName,
+                message: result.message,
+                defaultValue: `${providerName} 临时不可用: ${result.message}`,
+              }),
+              { description, duration: 8000, closeButton: true },
+            );
+          } else if (isProbeRejection) {
             toast.warning(
               t("streamCheck.rejected", {
                 providerName: providerName,
@@ -136,5 +156,5 @@ export function useStreamCheck(appId: AppId) {
     [checkingIds],
   );
 
-  return { checkProvider, isChecking };
+  return { checkProvider, isChecking, lastResults };
 }

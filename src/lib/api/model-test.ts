@@ -28,6 +28,10 @@ export interface StreamCheckResult {
   errorCategory?: string;
 }
 
+export type ProviderStreamCheckResult = StreamCheckResult & {
+  providerId: string;
+};
+
 // ===== 流式健康检查 API =====
 
 /**

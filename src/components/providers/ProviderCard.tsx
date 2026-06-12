@@ -1,5 +1,11 @@
 import { useMemo, useState, useEffect } from "react";
-import { GripVertical, ChevronDown, ChevronUp, Link2 } from "lucide-react";
+import {
+  GripVertical,
+  ChevronDown,
+  ChevronUp,
+  Clock3,
+  Link2,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type {
   DraggableAttributes,
@@ -17,6 +23,7 @@ import CodexOauthQuotaFooter from "@/components/CodexOauthQuotaFooter";
 import { PROVIDER_TYPES, TEMPLATE_TYPES } from "@/config/constants";
 import { isHermesReadOnlyProvider } from "@/config/hermesProviderPresets";
 import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
+import type { ProviderStreamCheckResult } from "@/lib/api/model-test";
 import { FailoverPriorityBadge } from "@/components/providers/FailoverPriorityBadge";
 import {
   extractCodexBaseUrl,
@@ -52,6 +59,7 @@ interface ProviderCardProps {
   onTest?: (provider: Provider) => void;
   onOpenTerminal?: (provider: Provider) => void;
   isTesting?: boolean;
+  lastTestResult?: ProviderStreamCheckResult;
   isProxyRunning: boolean;
   isProxyTakeover?: boolean; // 代理接管模式（Live配置已被接管，切换为热切换）
   dragHandleProps?: DragHandleProps;
@@ -153,6 +161,7 @@ export function ProviderCard({
   onTest,
   onOpenTerminal,
   isTesting,
+  lastTestResult,
   isProxyRunning,
   isProxyTakeover = false,
   dragHandleProps,
@@ -298,6 +307,79 @@ export function ProviderCard({
     (!isAnyOmo &&
       !isProxyTakeover &&
       (isActiveProvider || hasPersistentConfigHighlight));
+
+  const testResultView = useMemo(() => {
+    if (!lastTestResult) return null;
+
+    const statusConfig = {
+      operational: {
+        label: t("streamCheck.lastStatusOperational", {
+          defaultValue: "测试通过",
+        }),
+        container:
+          "border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+        dot: "bg-emerald-500",
+      },
+      degraded: {
+        label: t("streamCheck.lastStatusDegraded", {
+          defaultValue: "响应偏慢",
+        }),
+        container:
+          "border-amber-500/25 bg-amber-500/10 text-amber-800 dark:text-amber-300",
+        dot: "bg-amber-500",
+      },
+      failed: {
+        label: t("streamCheck.lastStatusFailed", {
+          defaultValue: "测试失败",
+        }),
+        container:
+          "border-red-500/20 bg-red-500/10 text-red-700 dark:text-red-300",
+        dot: "bg-red-500",
+      },
+    }[lastTestResult.status];
+
+    const detailParts = [
+      lastTestResult.modelUsed
+        ? t("streamCheck.lastModel", {
+            model: lastTestResult.modelUsed,
+            defaultValue: "模型 {{model}}",
+          })
+        : null,
+      typeof lastTestResult.responseTimeMs === "number"
+        ? t("streamCheck.lastLatency", {
+            latency: lastTestResult.responseTimeMs,
+            defaultValue: "{{latency}}ms",
+          })
+        : null,
+      lastTestResult.httpStatus
+        ? t("streamCheck.lastHttpStatus", {
+            status: lastTestResult.httpStatus,
+            defaultValue: "HTTP {{status}}",
+          })
+        : null,
+      lastTestResult.retryCount > 0
+        ? t("streamCheck.lastRetryCount", {
+            count: lastTestResult.retryCount,
+            defaultValue: "重试 {{count}} 次",
+          })
+        : null,
+    ].filter(Boolean);
+
+    const testedAt = lastTestResult.testedAt
+      ? new Date(lastTestResult.testedAt * 1000).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+        })
+      : null;
+
+    return {
+      ...statusConfig,
+      details: detailParts.join(" · "),
+      message:
+        lastTestResult.status === "failed" ? lastTestResult.message : null,
+      testedAt,
+    };
+  }, [lastTestResult, t]);
 
   return (
     <div
@@ -495,6 +577,48 @@ export function ProviderCard({
               >
                 <span className="truncate">{displayUrl}</span>
               </button>
+            )}
+
+            {testResultView && (
+              <div
+                className={cn(
+                  "mt-1 inline-flex max-w-full items-center gap-2 rounded-md border px-2 py-1 text-xs",
+                  testResultView.container,
+                )}
+                title={[
+                  testResultView.details,
+                  testResultView.message,
+                  testResultView.testedAt
+                    ? t("streamCheck.lastTestedAt", {
+                        time: testResultView.testedAt,
+                        defaultValue: "测试于 {{time}}",
+                      })
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join("\n")}
+              >
+                <span
+                  className={cn(
+                    "h-2 w-2 shrink-0 rounded-full",
+                    testResultView.dot,
+                  )}
+                />
+                <span className="shrink-0 font-medium">
+                  {testResultView.label}
+                </span>
+                {testResultView.details && (
+                  <span className="truncate text-current/75">
+                    {testResultView.details}
+                  </span>
+                )}
+                {testResultView.testedAt && (
+                  <span className="inline-flex shrink-0 items-center gap-1 text-current/65">
+                    <Clock3 className="h-3 w-3" />
+                    {testResultView.testedAt}
+                  </span>
+                )}
+              </div>
             )}
           </div>
         </div>

@@ -225,6 +225,11 @@ export function ProviderActions({
   const readOnlyHint = t("provider.managedByHermesHint", {
     defaultValue: "由 Hermes 管理，请在 Hermes Web UI 中编辑",
   });
+  const testButtonTitle = onTest
+    ? isTesting
+      ? t("modelTest.testing", { defaultValue: "正在测试模型" })
+      : t("modelTest.testProvider", "测试模型")
+    : t("modelTest.unavailable", { defaultValue: "当前供应商不支持模型测试" });
 
   return (
     <div className="flex items-center gap-1.5">
@@ -305,23 +310,27 @@ export function ProviderActions({
           <Copy className="h-4 w-4" />
         </Button>
 
-        <Button
-          size="icon"
-          variant="ghost"
-          onClick={onTest || undefined}
-          disabled={isTesting}
-          title={t("modelTest.testProvider", "测试模型")}
+        <span
+          title={testButtonTitle}
           className={cn(
-            iconButtonClass,
+            "inline-flex",
             !onTest && "opacity-40 cursor-not-allowed text-muted-foreground",
           )}
         >
-          {isTesting ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
-            <TestTube2 className="h-4 w-4" />
-          )}
-        </Button>
+          <Button
+            size="icon"
+            variant="ghost"
+            onClick={onTest || undefined}
+            disabled={isTesting || !onTest}
+            className={iconButtonClass}
+          >
+            {isTesting ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <TestTube2 className="h-4 w-4" />
+            )}
+          </Button>
+        </span>
 
         <Button
           size="icon"

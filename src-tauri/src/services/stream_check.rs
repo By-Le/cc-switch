@@ -121,7 +121,7 @@ impl StreamCheckService {
                 }
                 Ok(r) => {
                     // 失败但非异常，判断是否重试
-                    if Self::should_retry(&r.message) && attempt < effective_config.max_retries {
+                    if Self::should_retry_result(r) && attempt < effective_config.max_retries {
                         last_result = Some(r.clone());
                         continue;
                     }
@@ -131,8 +131,7 @@ impl StreamCheckService {
                     });
                 }
                 Err(e) => {
-                    if Self::should_retry(&e.to_string()) && attempt < effective_config.max_retries
-                    {
+                    if Self::should_retry_error(e) && attempt < effective_config.max_retries {
                         continue;
                     }
                     return Err(AppError::Message(e.to_string()));
@@ -1344,6 +1343,25 @@ impl StreamCheckService {
         lower.contains("timeout") || lower.contains("abort") || lower.contains("timed out")
     }
 
+    fn should_retry_result(result: &StreamCheckResult) -> bool {
+        result
+            .http_status
+            .map(Self::should_retry_http_status)
+            .unwrap_or(false)
+            || Self::should_retry(&result.message)
+    }
+
+    fn should_retry_error(error: &AppError) -> bool {
+        match error {
+            AppError::HttpStatus { status, .. } => Self::should_retry_http_status(*status),
+            _ => Self::should_retry(&error.to_string()),
+        }
+    }
+
+    fn should_retry_http_status(status: u16) -> bool {
+        status == 429 || (500..600).contains(&status)
+    }
+
     fn map_request_error(e: reqwest::Error) -> AppError {
         if e.is_timeout() {
             AppError::Message("Request timeout".to_string())
@@ -1392,16 +1410,23 @@ impl StreamCheckService {
         provider: &Provider,
         config: &StreamCheckConfig,
     ) -> String {
+        if let Some(model) = Self::extract_provider_test_model(provider) {
+            return model;
+        }
+
+        if let Some(model) = Self::extract_config_test_model(app_type, config) {
+            return model;
+        }
+
         match app_type {
             AppType::Claude | AppType::ClaudeDesktop => {
                 Self::extract_env_model(provider, "ANTHROPIC_MODEL")
-                    .unwrap_or_else(|| config.claude_model.clone())
+                    .unwrap_or_else(|| StreamCheckConfig::default().claude_model)
             }
-            AppType::Codex => {
-                Self::extract_codex_model(provider).unwrap_or_else(|| config.codex_model.clone())
-            }
+            AppType::Codex => Self::extract_codex_model(provider)
+                .unwrap_or_else(|| StreamCheckConfig::default().codex_model),
             AppType::Gemini => Self::extract_env_model(provider, "GEMINI_MODEL")
-                .unwrap_or_else(|| config.gemini_model.clone()),
+                .unwrap_or_else(|| StreamCheckConfig::default().gemini_model),
             AppType::OpenCode => {
                 // OpenCode uses models map in settings_config
                 // Try to extract first model from the models object
@@ -1412,6 +1437,36 @@ impl StreamCheckService {
                 // Try to extract first model from the models array
                 Self::extract_openclaw_model(provider).unwrap_or_else(|| "gpt-4o".to_string())
             }
+        }
+    }
+
+    fn extract_provider_test_model(provider: &Provider) -> Option<String> {
+        provider
+            .meta
+            .as_ref()
+            .and_then(|m| m.test_config.as_ref())
+            .filter(|tc| tc.enabled)
+            .and_then(|tc| tc.test_model.as_deref())
+            .and_then(Self::non_empty_model)
+    }
+
+    fn extract_config_test_model(app_type: &AppType, config: &StreamCheckConfig) -> Option<String> {
+        let model = match app_type {
+            AppType::Claude | AppType::ClaudeDesktop => &config.claude_model,
+            AppType::Codex => &config.codex_model,
+            AppType::Gemini => &config.gemini_model,
+            AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => return None,
+        };
+
+        Self::non_empty_model(model)
+    }
+
+    fn non_empty_model(value: &str) -> Option<String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
         }
     }
 
@@ -1599,6 +1654,7 @@ impl StreamCheckService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{ProviderMeta, ProviderTestConfig};
 
     fn make_provider(settings_config: serde_json::Value) -> Provider {
         Provider::with_id(
@@ -1743,6 +1799,78 @@ mod tests {
         assert!(StreamCheckService::should_retry("request timed out"));
         assert!(StreamCheckService::should_retry("connection abort"));
         assert!(!StreamCheckService::should_retry("API Key invalid"));
+
+        assert!(StreamCheckService::should_retry_http_status(429));
+        assert!(StreamCheckService::should_retry_http_status(500));
+        assert!(StreamCheckService::should_retry_http_status(502));
+        assert!(StreamCheckService::should_retry_http_status(503));
+        assert!(StreamCheckService::should_retry_http_status(504));
+        assert!(!StreamCheckService::should_retry_http_status(400));
+        assert!(!StreamCheckService::should_retry_http_status(401));
+        assert!(!StreamCheckService::should_retry_http_status(403));
+        assert!(!StreamCheckService::should_retry_http_status(404));
+    }
+
+    #[test]
+    fn test_resolve_test_model_uses_global_codex_test_model_before_runtime_model() {
+        let provider = make_provider(serde_json::json!({
+            "config": r#"model = "runtime-model"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+base_url = "https://example.com/v1""#
+        }));
+        let config = StreamCheckConfig {
+            codex_model: "global-test-model@low".to_string(),
+            ..StreamCheckConfig::default()
+        };
+
+        assert_eq!(
+            StreamCheckService::resolve_effective_test_model(&AppType::Codex, &provider, &config),
+            "global-test-model@low"
+        );
+    }
+
+    #[test]
+    fn test_resolve_test_model_uses_provider_test_model_before_global_config() {
+        let mut provider = make_provider(serde_json::json!({
+            "config": r#"model = "runtime-model""#
+        }));
+        provider.meta = Some(ProviderMeta {
+            test_config: Some(ProviderTestConfig {
+                enabled: true,
+                test_model: Some("provider-test-model".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = StreamCheckConfig {
+            codex_model: "global-test-model".to_string(),
+            ..StreamCheckConfig::default()
+        };
+
+        assert_eq!(
+            StreamCheckService::resolve_effective_test_model(&AppType::Codex, &provider, &config),
+            "provider-test-model"
+        );
+    }
+
+    #[test]
+    fn test_resolve_test_model_falls_back_to_runtime_model_when_test_models_are_empty() {
+        let provider = make_provider(serde_json::json!({
+            "config": r#"model = "runtime-model""#
+        }));
+        let config = StreamCheckConfig {
+            codex_model: "  ".to_string(),
+            ..StreamCheckConfig::default()
+        };
+
+        assert_eq!(
+            StreamCheckService::resolve_effective_test_model(&AppType::Codex, &provider, &config),
+            "runtime-model"
+        );
     }
 
     #[test]

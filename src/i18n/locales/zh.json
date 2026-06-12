@@ -2290,7 +2290,9 @@
     "title": "智能体"
   },
   "modelTest": {
-    "testProvider": "测试模型"
+    "testProvider": "测试模型",
+    "testing": "正在测试模型",
+    "unavailable": "当前供应商不支持模型测试"
   },
   "health": {
     "operational": "正常",
@@ -2518,7 +2520,16 @@
     "degraded": "{{providerName}} 响应较慢 ({{responseTimeMs}}ms)",
     "failed": "{{providerName}} 检查失败: {{message}}",
     "rejected": "{{providerName}} 检查被拒: {{message}}",
+    "temporary": "{{providerName}} 临时不可用: {{message}}",
     "error": "{{providerName}} 检查出错: {{error}}",
+    "lastStatusOperational": "测试通过",
+    "lastStatusDegraded": "响应偏慢",
+    "lastStatusFailed": "测试失败",
+    "lastModel": "模型 {{model}}",
+    "lastLatency": "{{latency}}ms",
+    "lastHttpStatus": "HTTP {{status}}",
+    "lastRetryCount": "重试 {{count}} 次",
+    "lastTestedAt": "测试于 {{time}}",
     "modelNotFound": "{{providerName}} 测试模型 {{model}} 不存在或已下架",
     "modelNotFoundHint": "该模型可能已被供应商弃用。请在\"模型测试配置\"中更新默认测试模型。",
     "quotaExceeded": "{{providerName}} Coding Plan 额度已用尽",
