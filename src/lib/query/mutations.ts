@@ -70,7 +70,9 @@ export const useAddProviderMutation = (appId: AppId) => {
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
-      await queryClient.invalidateQueries({ queryKey: ["failoverQueue", appId] });
+      await queryClient.invalidateQueries({
+        queryKey: ["failoverQueue", appId],
+      });
       await queryClient.invalidateQueries({
         queryKey: ["availableProvidersForFailover", appId],
       });
@@ -148,7 +150,9 @@ export const useUpdateProviderMutation = (appId: AppId) => {
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
-      await queryClient.invalidateQueries({ queryKey: ["failoverQueue", appId] });
+      await queryClient.invalidateQueries({
+        queryKey: ["failoverQueue", appId],
+      });
       await queryClient.invalidateQueries({
         queryKey: ["availableProvidersForFailover", appId],
       });
@@ -192,7 +196,9 @@ export const useDeleteProviderMutation = (appId: AppId) => {
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
-      await queryClient.invalidateQueries({ queryKey: ["failoverQueue", appId] });
+      await queryClient.invalidateQueries({
+        queryKey: ["failoverQueue", appId],
+      });
       await queryClient.invalidateQueries({
         queryKey: ["availableProvidersForFailover", appId],
       });

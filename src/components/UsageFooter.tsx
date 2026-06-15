@@ -68,7 +68,7 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
     lastQueriedAt,
     refetch,
   } = useUsageQuery(providerId, appId, {
-    enabled: usageEnabled,
+    enabled: usageEnabled && shouldAutoQuery,
     autoQueryInterval,
   });
 

@@ -667,14 +667,11 @@ fn reorder_failover_queue_updates_queue_priority() {
     let db = Database::memory().expect("create memory db");
 
     for (index, id) in ["alpha", "beta", "gamma"].iter().enumerate() {
-        let mut provider = Provider::with_id(
-            (*id).to_string(),
-            format!("Provider {id}"),
-            json!({}),
-            None,
-        );
+        let mut provider =
+            Provider::with_id((*id).to_string(), format!("Provider {id}"), json!({}), None);
         provider.sort_index = Some(index);
-        db.save_provider("claude", &provider).expect("save provider");
+        db.save_provider("claude", &provider)
+            .expect("save provider");
         db.add_to_failover_queue("claude", id)
             .expect("add provider to queue");
     }
@@ -699,14 +696,11 @@ fn reorder_failover_queue_rejects_stale_or_duplicate_ids() {
     let db = Database::memory().expect("create memory db");
 
     for (index, id) in ["alpha", "beta"].iter().enumerate() {
-        let mut provider = Provider::with_id(
-            (*id).to_string(),
-            format!("Provider {id}"),
-            json!({}),
-            None,
-        );
+        let mut provider =
+            Provider::with_id((*id).to_string(), format!("Provider {id}"), json!({}), None);
         provider.sort_index = Some(index);
-        db.save_provider("claude", &provider).expect("save provider");
+        db.save_provider("claude", &provider)
+            .expect("save provider");
         db.add_to_failover_queue("claude", id)
             .expect("add provider to queue");
     }

@@ -259,7 +259,11 @@ export function ProviderCard({
     : 0;
 
   const { data: usage } = useUsageQuery(provider.id, appId, {
-    enabled: usageEnabled && !isOfficial && !isOfficialSubscriptionUsage,
+    enabled:
+      shouldAutoQuery &&
+      usageEnabled &&
+      !isOfficial &&
+      !isOfficialSubscriptionUsage,
     autoQueryInterval,
   });
 

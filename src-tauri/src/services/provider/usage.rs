@@ -81,32 +81,48 @@ pub(crate) async fn execute_and_format_usage_result(
     }
 }
 
-/// Extract API key from provider configuration
-fn extract_api_key_from_provider(provider: &crate::provider::Provider) -> Option<String> {
-    if let Some(env) = provider.settings_config.get("env") {
-        // Try multiple possible API key fields
-        env.get("ANTHROPIC_AUTH_TOKEN")
-            .or_else(|| env.get("ANTHROPIC_API_KEY"))
-            .or_else(|| env.get("OPENROUTER_API_KEY"))
-            .or_else(|| env.get("GOOGLE_API_KEY"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    } else {
-        None
-    }
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
-/// Extract base URL from provider configuration
-fn extract_base_url_from_provider(provider: &crate::provider::Provider) -> Option<String> {
-    if let Some(env) = provider.settings_config.get("env") {
-        // Try multiple possible base URL fields
-        env.get("ANTHROPIC_BASE_URL")
-            .or_else(|| env.get("GOOGLE_GEMINI_BASE_URL"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim_end_matches('/').to_string())
-    } else {
-        None
+fn normalize_base_url(base_url: String) -> String {
+    base_url.trim_end_matches('/').to_string()
+}
+
+/// Resolve credentials for JS usage scripts.
+///
+/// Only the `general` template inherits provider credentials. Custom/New API
+/// templates must provide their own values explicitly.
+fn resolve_usage_script_credentials(
+    app_type: &AppType,
+    provider: &crate::provider::Provider,
+    usage_script: &UsageScript,
+) -> (String, String) {
+    let api_key = non_empty(usage_script.api_key.as_deref()).unwrap_or_default();
+    let base_url = non_empty(usage_script.base_url.as_deref())
+        .map(normalize_base_url)
+        .unwrap_or_default();
+
+    if usage_script.template_type.as_deref() != Some("general") {
+        return (api_key, base_url);
     }
+
+    let (provider_base_url, provider_api_key) = provider.resolve_usage_credentials(app_type);
+    let api_key = if api_key.is_empty() {
+        provider_api_key
+    } else {
+        api_key
+    };
+    let base_url = if base_url.is_empty() {
+        provider_base_url
+    } else {
+        base_url
+    };
+
+    (api_key, base_url)
 }
 
 /// Query provider usage (using saved script configuration)
@@ -144,20 +160,8 @@ pub async fn query_usage(
             ));
         }
 
-        // Get credentials: prioritize UsageScript values, fallback to provider config
-        let api_key = usage_script
-            .api_key
-            .clone()
-            .filter(|k| !k.is_empty())
-            .or_else(|| extract_api_key_from_provider(provider))
-            .unwrap_or_default();
-
-        let base_url = usage_script
-            .base_url
-            .clone()
-            .filter(|u| !u.is_empty())
-            .or_else(|| extract_base_url_from_provider(provider))
-            .unwrap_or_default();
+        let (api_key, base_url) =
+            resolve_usage_script_credentials(&app_type, provider, usage_script);
 
         (
             usage_script.code.clone(),
@@ -196,11 +200,13 @@ pub async fn test_usage_script(
     user_id: Option<&str>,
     template_type: Option<&str>,
 ) -> Result<UsageResult, AppError> {
-    // Use provided credential parameters directly for testing
+    let api_key = non_empty(api_key).unwrap_or_default();
+    let base_url = non_empty(base_url).map(normalize_base_url).unwrap_or_default();
+
     execute_and_format_usage_result(
         script_code,
-        api_key.unwrap_or(""),
-        base_url.unwrap_or(""),
+        &api_key,
+        &base_url,
         timeout,
         access_token,
         user_id,
@@ -225,4 +231,125 @@ pub(crate) fn validate_usage_script(script: &UsageScript) -> Result<(), AppError
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_base_url, resolve_usage_script_credentials};
+    use crate::app_config::AppType;
+    use crate::provider::{Provider, UsageScript};
+    use serde_json::json;
+
+    fn usage_script(api_key: Option<&str>, base_url: Option<&str>) -> UsageScript {
+        UsageScript {
+            enabled: true,
+            language: "javascript".to_string(),
+            code: String::new(),
+            timeout: Some(10),
+            api_key: api_key.map(str::to_string),
+            base_url: base_url.map(str::to_string),
+            access_token: None,
+            user_id: None,
+            template_type: Some("general".to_string()),
+            auto_query_interval: None,
+            coding_plan_provider: None,
+        }
+    }
+
+    #[test]
+    fn general_usage_script_credentials_fall_back_to_provider_config() {
+        let provider = Provider::with_id(
+            "codex-provider".to_string(),
+            "Codex Provider".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "sk-codex" },
+                "config": "model_provider = \"custom\"\n\
+                           [model_providers.custom]\n\
+                           base_url = \"https://codex.example.com/v1/\"\n",
+            }),
+            None,
+        );
+        let script = usage_script(None, None);
+
+        let (api_key, base_url) =
+            resolve_usage_script_credentials(&AppType::Codex, &provider, &script);
+
+        assert_eq!(api_key, "sk-codex");
+        assert_eq!(base_url, "https://codex.example.com/v1");
+    }
+
+    #[test]
+    fn non_general_usage_script_does_not_fall_back_to_provider_config() {
+        let provider = Provider::with_id(
+            "claude-provider".to_string(),
+            "Claude Provider".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://provider.example.com/v1",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-provider"
+                }
+            }),
+            None,
+        );
+        let mut script = usage_script(None, None);
+        script.template_type = Some("custom".to_string());
+
+        let (api_key, base_url) =
+            resolve_usage_script_credentials(&AppType::Claude, &provider, &script);
+
+        assert_eq!(api_key, "");
+        assert_eq!(base_url, "");
+    }
+
+    #[test]
+    fn blank_usage_script_credentials_fall_back_to_provider_config() {
+        let provider = Provider::with_id(
+            "claude-provider".to_string(),
+            "Claude Provider".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://claude.example.com/v1/",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-claude"
+                }
+            }),
+            None,
+        );
+        let script = usage_script(Some("  "), Some(""));
+
+        let (api_key, base_url) =
+            resolve_usage_script_credentials(&AppType::Claude, &provider, &script);
+
+        assert_eq!(api_key, "sk-claude");
+        assert_eq!(base_url, "https://claude.example.com/v1");
+    }
+
+    #[test]
+    fn usage_script_credentials_override_provider_config() {
+        let provider = Provider::with_id(
+            "claude-provider".to_string(),
+            "Claude Provider".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://provider.example.com/v1",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-provider"
+                }
+            }),
+            None,
+        );
+        let script = usage_script(Some("sk-script"), Some("https://script.example.com/api/"));
+
+        let (api_key, base_url) =
+            resolve_usage_script_credentials(&AppType::Claude, &provider, &script);
+
+        assert_eq!(api_key, "sk-script");
+        assert_eq!(base_url, "https://script.example.com/api");
+    }
+
+    #[test]
+    fn base_url_normalization_trims_trailing_slashes() {
+        assert_eq!(
+            normalize_base_url("https://explicit.example.com/v1///".to_string()),
+            "https://explicit.example.com/v1"
+        );
+    }
 }

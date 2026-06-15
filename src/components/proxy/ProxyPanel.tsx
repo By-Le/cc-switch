@@ -683,8 +683,7 @@ function ProviderQueueGroup({
       <div className="space-y-1.5">
         {targets.map((target, index) => {
           const activeSession = activeSessionsByProvider.get(target.id);
-          const activeConnectionCount =
-            activeSession?.active_connections ?? 0;
+          const activeConnectionCount = activeSession?.active_connections ?? 0;
 
           return (
             <ProviderQueueItem

@@ -476,6 +476,13 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
   const handleTest = async () => {
     setTesting(true);
     try {
+      const explicitApiKey = script.apiKey?.trim() || undefined;
+      const explicitBaseUrl = script.baseUrl?.trim() || undefined;
+      const generalApiKey =
+        explicitApiKey ?? providerCredentials.apiKey?.trim() ?? undefined;
+      const generalBaseUrl =
+        explicitBaseUrl ?? providerCredentials.baseUrl?.trim() ?? undefined;
+
       // 官方订阅额度模板使用 CLI/OAuth 凭据和官方 API
       if (selectedTemplate === TEMPLATE_TYPES.OFFICIAL_SUBSCRIPTION) {
         const { subscriptionApi } = await import("@/lib/api/subscription");
@@ -500,8 +507,8 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
 
       // 官方余额查询模板使用专用 API
       if (selectedTemplate === TEMPLATE_TYPES.BALANCE) {
-        const baseUrl = providerCredentials.baseUrl ?? "";
-        const apiKey = providerCredentials.apiKey ?? "";
+        const baseUrl = generalBaseUrl ?? "";
+        const apiKey = generalApiKey ?? "";
         const { subscriptionApi } = await import("@/lib/api/subscription");
         const result = await subscriptionApi.getBalance(baseUrl, apiKey);
         if (result.success && result.data && result.data.length > 0) {
@@ -533,11 +540,11 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
         // ZenMux 使用用户在脚本配置中手动填入的 API Key 和 Base URL
         const isZenMux = script.codingPlanProvider === "zenmux";
         const baseUrl = isZenMux
-          ? (script.baseUrl ?? "")
-          : (providerCredentials.baseUrl ?? "");
+          ? (explicitBaseUrl ?? "")
+          : (generalBaseUrl ?? "");
         const apiKey = isZenMux
-          ? (script.apiKey ?? "")
-          : (providerCredentials.apiKey ?? "");
+          ? (explicitApiKey ?? "")
+          : (generalApiKey ?? "");
         const { subscriptionApi } = await import("@/lib/api/subscription");
         const quota = await subscriptionApi.getCodingPlanQuota(baseUrl, apiKey);
         if (quota.success && quota.tiers.length > 0) {
@@ -606,8 +613,12 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
         appId,
         script.code,
         script.timeout,
-        script.apiKey,
-        script.baseUrl,
+        selectedTemplate === TEMPLATE_TYPES.GENERAL
+          ? generalApiKey
+          : explicitApiKey,
+        selectedTemplate === TEMPLATE_TYPES.GENERAL
+          ? generalBaseUrl
+          : explicitBaseUrl,
         script.accessToken,
         script.userId,
         selectedTemplate as "custom" | "general" | "newapi" | undefined,

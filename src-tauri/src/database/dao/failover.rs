@@ -171,8 +171,7 @@ impl Database {
             }
         }
 
-        tx.commit()
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(())
     }
