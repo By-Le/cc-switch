@@ -69,6 +69,21 @@ use tauri::RunEvent;
 use tauri::{Emitter, Manager};
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
+#[cfg(all(test, target_os = "windows", target_env = "msvc"))]
+macro_rules! msvc_linker_directive {
+    ($name:ident, $bytes:expr) => {
+        #[used]
+        #[link_section = ".drectve"]
+        static $name: [u8; $bytes.len()] = *$bytes;
+    };
+}
+
+#[cfg(all(test, target_os = "windows", target_env = "msvc"))]
+msvc_linker_directive!(
+    COMMON_CONTROLS_TEST_MANIFEST,
+    b" /manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\""
+);
+
 #[cfg(target_os = "windows")]
 fn set_windows_app_user_model_id(app: &tauri::AppHandle) {
     let app_id = app.config().identifier.clone();

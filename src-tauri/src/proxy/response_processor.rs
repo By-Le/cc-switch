@@ -376,7 +376,6 @@ pub async fn process_response(
 // ============================================================================
 
 type UsageCallbackWithTiming = Arc<dyn Fn(Vec<Value>, Option<u64>) + Send + Sync + 'static>;
-type StreamFailureCallback = Arc<dyn Fn(String) + Send + Sync + 'static>;
 
 /// SSE 使用量收集器
 #[derive(Clone)]
@@ -497,20 +496,14 @@ pub struct StreamFailureTracker {
 }
 
 struct StreamFailureTrackerInner {
-    callback: StreamFailureCallback,
+    load_balancer: ProviderLoadBalancer,
+    app_type: String,
+    session_id: String,
+    provider_id: String,
     finished: AtomicBool,
 }
 
 impl StreamFailureTracker {
-    pub fn new(callback: impl Fn(String) + Send + Sync + 'static) -> Self {
-        Self {
-            inner: Arc::new(StreamFailureTrackerInner {
-                callback: Arc::new(callback),
-                finished: AtomicBool::new(false),
-            }),
-        }
-    }
-
     pub fn from_session_failure(
         load_balancer: ProviderLoadBalancer,
         app_type: String,
@@ -521,20 +514,15 @@ impl StreamFailureTracker {
             return None;
         }
 
-        Some(Self::new(move |reason| {
-            let load_balancer = load_balancer.clone();
-            let app_type = app_type.clone();
-            let session_id = session_id.clone();
-            let provider_id = provider_id.clone();
-            tokio::spawn(async move {
-                log::warn!(
-                    "[{app_type}] 流式响应失败，临时避让会话 provider: session={session_id}, provider={provider_id}, reason={reason}"
-                );
-                load_balancer
-                    .record_failure(&app_type, &session_id, &provider_id)
-                    .await;
-            });
-        }))
+        Some(Self {
+            inner: Arc::new(StreamFailureTrackerInner {
+                load_balancer,
+                app_type,
+                session_id,
+                provider_id,
+                finished: AtomicBool::new(false),
+            }),
+        })
     }
 
     async fn record_failure(&self, reason: String) {
@@ -542,7 +530,21 @@ impl StreamFailureTracker {
             return;
         }
 
-        (self.inner.callback)(reason);
+        log::warn!(
+            "[{}] 流式响应失败，临时避让会话 provider: session={}, provider={}, reason={}",
+            self.inner.app_type,
+            self.inner.session_id,
+            self.inner.provider_id,
+            reason
+        );
+        self.inner
+            .load_balancer
+            .record_failure(
+                &self.inner.app_type,
+                &self.inner.session_id,
+                &self.inner.provider_id,
+            )
+            .await;
     }
 }
 
@@ -762,6 +764,7 @@ pub fn create_logged_passthrough_stream(
         let inspect_sse_events =
             collector.is_some() || failure_tracker.is_some() || log::log_enabled!(log::Level::Debug);
         let mut is_first_chunk = true;
+        let mut saw_normal_end_marker = false;
 
         // 超时配置
         let first_byte_timeout = if timeout_config.first_byte_timeout > 0 {
@@ -856,8 +859,12 @@ pub fn create_logged_passthrough_stream(
                                                         .await;
                                                 }
                                             }
+                                            if is_normal_stream_end_event(data) {
+                                                saw_normal_end_marker = true;
+                                            }
                                         } else {
                                             log::debug!("[{tag}] <<< SSE: [DONE]");
+                                            saw_normal_end_marker = true;
                                         }
                                     }
                                 }
@@ -876,7 +883,13 @@ pub fn create_logged_passthrough_stream(
                     break;
                 }
                 None => {
-                    // 流正常结束
+                    if !saw_normal_end_marker {
+                        if let Some(tracker) = &failure_tracker {
+                            tracker
+                                .record_failure("流式响应提前结束，未收到正常终止标记".to_string())
+                                .await;
+                        }
+                    }
                     break;
                 }
             }
@@ -899,9 +912,39 @@ fn is_provider_stream_failure_event(data: &str) -> bool {
         .is_some_and(|error_type| error_type == "stream_error")
 }
 
+fn is_normal_stream_end_event(data: &str) -> bool {
+    serde_json::from_str::<Value>(data)
+        .ok()
+        .as_ref()
+        .and_then(stream_end_type)
+        .is_some()
+}
+
 fn extract_stream_failure_reason(data: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(data).ok()?;
     stream_failure_message(&value).or_else(|| stream_failure_type(&value).map(ToString::to_string))
+}
+
+fn stream_end_type(value: &Value) -> Option<&str> {
+    value
+        .pointer("/type")
+        .and_then(Value::as_str)
+        .filter(|event_type| matches!(*event_type, "message_stop" | "response.completed"))
+        .or_else(|| gemini_finish_reason(value))
+}
+
+fn gemini_finish_reason(value: &Value) -> Option<&str> {
+    value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| {
+            candidates.iter().find_map(|candidate| {
+                candidate
+                    .get("finishReason")
+                    .and_then(Value::as_str)
+                    .filter(|reason| !reason.is_empty())
+            })
+        })
 }
 
 fn stream_failure_type(value: &Value) -> Option<&str> {
@@ -943,7 +986,10 @@ mod tests {
         codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore,
     };
     use crate::proxy::types::{ProxyConfig, ProxyStatus};
+    use bytes::Bytes;
+    use futures::stream;
     use rust_decimal::Decimal;
+    use serde_json::json;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -1077,6 +1123,106 @@ mod tests {
             .as_deref(),
             Some("connection lost")
         );
+    }
+
+    #[test]
+    fn stream_end_detector_matches_known_terminal_events() {
+        assert!(is_normal_stream_end_event(r#"{"type":"message_stop"}"#));
+        assert!(is_normal_stream_end_event(
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#
+        ));
+        assert!(is_normal_stream_end_event(
+            r#"{"responseId":"resp_1","candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"totalTokenCount":15}}"#
+        ));
+        assert!(!is_normal_stream_end_event(
+            r#"{"type":"response.output_item.done"}"#
+        ));
+        assert!(!is_normal_stream_end_event(
+            r#"{"type":"response.output_text.delta"}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn passthrough_stream_records_failure_when_terminal_event_is_missing() {
+        let balancer = ProviderLoadBalancer::default();
+        let providers = test_providers();
+        let stream = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\"}\n\n",
+        ))]);
+        let tracker = StreamFailureTracker::from_session_failure(
+            balancer.clone(),
+            "claude".to_string(),
+            "session-a".to_string(),
+            providers[0].id.clone(),
+        )
+        .expect("tracker");
+
+        collect_passthrough_stream(stream, tracker).await;
+
+        let ordered = balancer
+            .order_providers_for_session("claude", "session-a", &providers)
+            .await;
+        assert_eq!(ordered[0].id, providers[1].id);
+    }
+
+    #[tokio::test]
+    async fn passthrough_stream_keeps_provider_when_terminal_event_is_seen() {
+        let balancer = ProviderLoadBalancer::default();
+        let providers = test_providers();
+        let stream = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ))]);
+        let tracker = StreamFailureTracker::from_session_failure(
+            balancer.clone(),
+            "claude".to_string(),
+            "session-a".to_string(),
+            providers[0].id.clone(),
+        )
+        .expect("tracker");
+
+        collect_passthrough_stream(stream, tracker).await;
+
+        let ordered = balancer
+            .order_providers_for_session("claude", "session-a", &providers)
+            .await;
+        assert_eq!(ordered[0].id, providers[0].id);
+    }
+
+    async fn collect_passthrough_stream(
+        source: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+        tracker: StreamFailureTracker,
+    ) {
+        let output = create_logged_passthrough_stream(
+            source,
+            "test",
+            None,
+            Some(tracker),
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(output.into_iter().all(|chunk| chunk.is_ok()));
+    }
+
+    fn test_providers() -> Vec<crate::provider::Provider> {
+        vec![
+            crate::provider::Provider::with_id(
+                "provider-a".to_string(),
+                "Provider A".to_string(),
+                json!({}),
+                None,
+            ),
+            crate::provider::Provider::with_id(
+                "provider-b".to_string(),
+                "Provider B".to_string(),
+                json!({}),
+                None,
+            ),
+        ]
     }
 
     fn build_state(db: Arc<Database>) -> ProxyState {
