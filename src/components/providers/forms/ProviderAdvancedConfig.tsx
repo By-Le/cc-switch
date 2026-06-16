@@ -10,6 +10,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
   SelectContent,
@@ -146,7 +147,7 @@ export function ProviderAdvancedConfig({
                 </Label>
                 <Input
                   id="test-model"
-                  value={testConfig.testModel || ""}
+                  value={testConfig.testModel ?? ""}
                   onChange={(e) =>
                     onTestConfigChange({
                       ...testConfig,
@@ -169,7 +170,7 @@ export function ProviderAdvancedConfig({
                   id="test-timeout"
                   type="number"
                   min={1}
-                  max={300}
+                  max={120}
                   value={testConfig.timeoutSecs || ""}
                   onChange={(e) =>
                     onTestConfigChange({
@@ -180,25 +181,6 @@ export function ProviderAdvancedConfig({
                     })
                   }
                   placeholder="45"
-                  disabled={!testConfig.enabled}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="test-prompt">
-                  {t("providerAdvanced.testPrompt", {
-                    defaultValue: "测试提示词",
-                  })}
-                </Label>
-                <Input
-                  id="test-prompt"
-                  value={testConfig.testPrompt || ""}
-                  onChange={(e) =>
-                    onTestConfigChange({
-                      ...testConfig,
-                      testPrompt: e.target.value || undefined,
-                    })
-                  }
-                  placeholder="Who are you?"
                   disabled={!testConfig.enabled}
                 />
               </div>
@@ -236,7 +218,7 @@ export function ProviderAdvancedConfig({
                   id="max-retries"
                   type="number"
                   min={0}
-                  max={10}
+                  max={5}
                   value={testConfig.maxRetries ?? ""}
                   onChange={(e) =>
                     onTestConfigChange({
@@ -246,10 +228,31 @@ export function ProviderAdvancedConfig({
                         : undefined,
                     })
                   }
-                  placeholder="2"
+                  placeholder="1"
                   disabled={!testConfig.enabled}
                 />
               </div>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="test-prompt">
+                {t("providerAdvanced.testPrompt", {
+                  defaultValue: "测试提示词",
+                })}
+              </Label>
+              <Textarea
+                id="test-prompt"
+                value={testConfig.testPrompt ?? ""}
+                onChange={(e) =>
+                  onTestConfigChange({
+                    ...testConfig,
+                    testPrompt: e.target.value || undefined,
+                  })
+                }
+                placeholder="Who are you?"
+                rows={2}
+                className="min-h-[60px]"
+                disabled={!testConfig.enabled}
+              />
             </div>
           </div>
         </div>

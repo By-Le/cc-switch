@@ -2,8 +2,8 @@ import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Save, Loader2 } from "lucide-react";
 import { toast } from "sonner";
@@ -98,7 +98,15 @@ export function ModelTestConfigPanel() {
         </Alert>
       )}
 
-      {/* 测试模型配置 */}
+      <Alert>
+        <AlertDescription>
+          {t("streamCheck.modelTestNote", {
+            defaultValue:
+              "模型测试会发送一条真实流式请求，成功代表当前鉴权、接口和所选模型可用。",
+          })}
+        </AlertDescription>
+      </Alert>
+
       <div className="space-y-4">
         <h4 className="text-sm font-medium text-muted-foreground">
           {t("streamCheck.testModels")}
@@ -112,7 +120,7 @@ export function ModelTestConfigPanel() {
               onChange={(e) =>
                 setConfig({ ...config, claudeModel: e.target.value })
               }
-              placeholder="claude-3-5-haiku-latest"
+              placeholder="claude-haiku-4-5-20251001"
             />
           </div>
 
@@ -124,7 +132,7 @@ export function ModelTestConfigPanel() {
               onChange={(e) =>
                 setConfig({ ...config, codexModel: e.target.value })
               }
-              placeholder="gpt-4o-mini"
+              placeholder="gpt-5.5@low"
             />
           </div>
 
@@ -136,7 +144,7 @@ export function ModelTestConfigPanel() {
               onChange={(e) =>
                 setConfig({ ...config, geminiModel: e.target.value })
               }
-              placeholder="gemini-1.5-flash"
+              placeholder="gemini-3.5-flash"
             />
           </div>
         </div>
@@ -194,7 +202,6 @@ export function ModelTestConfigPanel() {
           </div>
         </div>
 
-        {/* 检查提示词配置 */}
         <div className="space-y-2">
           <Label htmlFor="testPrompt">{t("streamCheck.testPrompt")}</Label>
           <Textarea

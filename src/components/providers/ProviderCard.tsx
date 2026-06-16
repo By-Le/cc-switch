@@ -245,9 +245,6 @@ export function ProviderCard({
     provider.meta?.apiFormat,
     (provider.settingsConfig as Record<string, any>)?.config,
   ]);
-  const isClaudeThirdParty =
-    appId === "claude" && provider.category === "third_party";
-
   // 获取用量数据以判断是否有多套餐
   // 累加模式应用（OpenCode/OpenClaw/Hermes）：使用 isInConfig 代替 isCurrent
   const shouldAutoQuery =
@@ -710,11 +707,10 @@ export function ProviderCard({
               onEdit={() => onEdit(provider)}
               onDuplicate={() => onDuplicate(provider)}
               onTest={
-                onTest &&
-                !isOfficial &&
-                !isCopilot &&
-                !isCodexOauth &&
-                !isClaudeThirdParty
+                // 真实模型测试只对非官方供应商开放。官方供应商 (category ===
+                // "official") 的 base_url 往往留空并依赖客户端内置/OAuth 端点，
+                // cc-switch 无法稳定构造可验证的独立测试请求。
+                onTest && provider.category !== "official"
                   ? () => onTest(provider)
                   : undefined
               }

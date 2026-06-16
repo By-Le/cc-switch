@@ -96,6 +96,7 @@ impl StreamCheckService {
         auth_override: Option<AuthInfo>,
         base_url_override: Option<String>,
         claude_api_format_override: Option<String>,
+        model_override: Option<String>,
     ) -> Result<StreamCheckResult, AppError> {
         // 合并供应商单独配置和全局配置
         let effective_config = Self::merge_provider_config(provider, config);
@@ -109,6 +110,7 @@ impl StreamCheckService {
                 auth_override.clone(),
                 base_url_override.clone(),
                 claude_api_format_override.clone(),
+                model_override.clone(),
             )
             .await;
 
@@ -121,7 +123,7 @@ impl StreamCheckService {
                 }
                 Ok(r) => {
                     // 失败但非异常，判断是否重试
-                    if Self::should_retry_result(r) && attempt < effective_config.max_retries {
+                    if Self::should_retry(&r.message) && attempt < effective_config.max_retries {
                         last_result = Some(r.clone());
                         continue;
                     }
@@ -131,7 +133,8 @@ impl StreamCheckService {
                     });
                 }
                 Err(e) => {
-                    if Self::should_retry_error(e) && attempt < effective_config.max_retries {
+                    if Self::should_retry(&e.to_string()) && attempt < effective_config.max_retries
+                    {
                         continue;
                     }
                     return Err(AppError::Message(e.to_string()));
@@ -201,6 +204,7 @@ impl StreamCheckService {
         auth_override: Option<AuthInfo>,
         base_url_override: Option<String>,
         claude_api_format_override: Option<String>,
+        model_override: Option<String>,
     ) -> Result<StreamCheckResult, AppError> {
         let start = Instant::now();
 
@@ -211,7 +215,14 @@ impl StreamCheckService {
             app_type,
             AppType::OpenCode | AppType::OpenClaw | AppType::Hermes
         ) {
-            return Self::check_once_without_adapter(app_type, provider, config, start).await;
+            return Self::check_once_without_adapter(
+                app_type,
+                provider,
+                config,
+                model_override.as_deref(),
+                start,
+            )
+            .await;
         }
 
         let adapter: Box<dyn ProviderAdapter> = if matches!(app_type, AppType::ClaudeDesktop) {
@@ -235,7 +246,7 @@ impl StreamCheckService {
         let client = crate::proxy::http_client::get();
         let request_timeout = std::time::Duration::from_secs(config.timeout_secs);
 
-        let model_to_test = Self::resolve_test_model(app_type, provider, config);
+        let model_to_test = Self::resolve_test_model(app_type, provider, config, model_override.as_deref());
         let test_prompt = &config.test_prompt;
 
         let result = match app_type {
@@ -290,6 +301,20 @@ impl StreamCheckService {
             config.degraded_threshold_ms,
             &model_to_test,
         ))
+    }
+
+    /// Provider 级自定义 User-Agent（`meta.customUserAgent`），经 `parse_custom_user_agent` 校验。
+    ///
+    /// 与 forwarder 转发路径（`RequestForwarder::forward`）、model_fetch 共用单一口径：trim、
+    /// 空串视为未设置、**非法值静默忽略**（返回 `None`，不报错）。Stream Check 必须复用同一个
+    /// UA 去探测，否则会与真实流量用不同的 User-Agent（例如 Kimi Coding Plan 的 UA 白名单），
+    /// 导致"检测失败但代理可用"或反之的分歧——非法 UA 时尤甚（转发静默丢弃、检测却会因
+    /// reqwest 非法头在 `.send()` 报错）。
+    fn custom_user_agent(provider: &Provider) -> Option<reqwest::header::HeaderValue> {
+        provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.custom_user_agent_header().ok().flatten())
     }
 
     /// Claude 流式检查
@@ -488,6 +513,14 @@ impl StreamCheckService {
             }
         }
 
+        // Provider 级自定义 User-Agent（meta.customUserAgent）覆盖默认 UA，与 forwarder
+        // 转发路径口径一致；Copilot 指纹 UA 不可被覆盖。
+        if !is_github_copilot {
+            if let Some(ua) = Self::custom_user_agent(provider) {
+                request_builder = request_builder.header("user-agent", ua);
+            }
+        }
+
         let response = request_builder
             .timeout(timeout)
             .json(&body)
@@ -548,6 +581,15 @@ impl StreamCheckService {
         let os_name = Self::get_os_name();
         let arch_name = Self::get_arch_name();
 
+        // Provider 级自定义 User-Agent（meta.customUserAgent）覆盖默认 codex UA，与 forwarder
+        // 转发路径口径一致——否则 Stream Check 会用与真实流量不同的 UA 探测（如 Kimi UA 白名单）。
+        let user_agent = Self::custom_user_agent(provider).unwrap_or_else(|| {
+            reqwest::header::HeaderValue::from_str(&format!(
+                "codex_cli_rs/0.80.0 ({os_name} 15.7.2; {arch_name}) Terminal"
+            ))
+            .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("codex_cli_rs/0.80.0"))
+        });
+
         let mut body = if uses_chat {
             // Chat Completions 请求体（与 transform_codex_chat::responses_to_chat_completions 对齐）
             json!({
@@ -585,10 +627,7 @@ impl StreamCheckService {
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream")
                 .header("accept-encoding", "identity")
-                .header(
-                    "user-agent",
-                    format!("codex_cli_rs/0.80.0 ({os_name} 15.7.2; {arch_name}) Terminal"),
-                )
+                .header("user-agent", user_agent.clone())
                 .header("originator", "codex_cli_rs")
                 .timeout(timeout)
                 .json(&body)
@@ -656,11 +695,22 @@ impl StreamCheckService {
             }]
         });
 
-        let mut request_builder = client
-            .post(&url)
-            .header("x-goog-api-key", &auth.api_key)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream");
+        let mut request_builder = match auth.strategy {
+            AuthStrategy::GoogleOAuth => {
+                let token = auth.access_token.as_ref().unwrap_or(&auth.api_key);
+                client
+                    .post(&url)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("x-goog-api-client", "GeminiCLI/1.0")
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "text/event-stream")
+            }
+            _ => client
+                .post(&url)
+                .header("x-goog-api-key", &auth.api_key)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream"),
+        };
 
         // 供应商自定义 headers 最后追加
         if let Some(headers) = extra_headers {
@@ -708,13 +758,14 @@ impl StreamCheckService {
         app_type: &AppType,
         provider: &Provider,
         config: &StreamCheckConfig,
+        model_override: Option<&str>,
         start: Instant,
     ) -> Result<StreamCheckResult, AppError> {
         // 获取 HTTP 客户端
         let client = crate::proxy::http_client::get();
         let request_timeout = std::time::Duration::from_secs(config.timeout_secs);
 
-        let model_to_test = Self::resolve_test_model(app_type, provider, config);
+        let model_to_test = Self::resolve_test_model(app_type, provider, config, model_override);
         let test_prompt = &config.test_prompt;
 
         let result = match app_type {
@@ -1343,25 +1394,6 @@ impl StreamCheckService {
         lower.contains("timeout") || lower.contains("abort") || lower.contains("timed out")
     }
 
-    fn should_retry_result(result: &StreamCheckResult) -> bool {
-        result
-            .http_status
-            .map(Self::should_retry_http_status)
-            .unwrap_or(false)
-            || Self::should_retry(&result.message)
-    }
-
-    fn should_retry_error(error: &AppError) -> bool {
-        match error {
-            AppError::HttpStatus { status, .. } => Self::should_retry_http_status(*status),
-            _ => Self::should_retry(&error.to_string()),
-        }
-    }
-
-    fn should_retry_http_status(status: u16) -> bool {
-        status == 429 || (500..600).contains(&status)
-    }
-
     fn map_request_error(e: reqwest::Error) -> AppError {
         if e.is_timeout() {
             AppError::Message("Request timeout".to_string())
@@ -1409,24 +1441,37 @@ impl StreamCheckService {
         app_type: &AppType,
         provider: &Provider,
         config: &StreamCheckConfig,
+        model_override: Option<&str>,
     ) -> String {
-        if let Some(model) = Self::extract_provider_test_model(provider) {
-            return model;
+        if let Some(override_model) = model_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return override_model.to_string();
         }
 
-        if let Some(model) = Self::extract_config_test_model(app_type, config) {
-            return model;
+        if let Some(test_model) = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.test_config.as_ref())
+            .filter(|test_config| test_config.enabled)
+            .and_then(|test_config| test_config.test_model.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return test_model.to_string();
         }
 
         match app_type {
             AppType::Claude | AppType::ClaudeDesktop => {
                 Self::extract_env_model(provider, "ANTHROPIC_MODEL")
-                    .unwrap_or_else(|| StreamCheckConfig::default().claude_model)
+                    .unwrap_or_else(|| config.claude_model.clone())
             }
-            AppType::Codex => Self::extract_codex_model(provider)
-                .unwrap_or_else(|| StreamCheckConfig::default().codex_model),
+            AppType::Codex => {
+                Self::extract_codex_model(provider).unwrap_or_else(|| config.codex_model.clone())
+            }
             AppType::Gemini => Self::extract_env_model(provider, "GEMINI_MODEL")
-                .unwrap_or_else(|| StreamCheckConfig::default().gemini_model),
+                .unwrap_or_else(|| config.gemini_model.clone()),
             AppType::OpenCode => {
                 // OpenCode uses models map in settings_config
                 // Try to extract first model from the models object
@@ -1437,36 +1482,6 @@ impl StreamCheckService {
                 // Try to extract first model from the models array
                 Self::extract_openclaw_model(provider).unwrap_or_else(|| "gpt-4o".to_string())
             }
-        }
-    }
-
-    fn extract_provider_test_model(provider: &Provider) -> Option<String> {
-        provider
-            .meta
-            .as_ref()
-            .and_then(|m| m.test_config.as_ref())
-            .filter(|tc| tc.enabled)
-            .and_then(|tc| tc.test_model.as_deref())
-            .and_then(Self::non_empty_model)
-    }
-
-    fn extract_config_test_model(app_type: &AppType, config: &StreamCheckConfig) -> Option<String> {
-        let model = match app_type {
-            AppType::Claude | AppType::ClaudeDesktop => &config.claude_model,
-            AppType::Codex => &config.codex_model,
-            AppType::Gemini => &config.gemini_model,
-            AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => return None,
-        };
-
-        Self::non_empty_model(model)
-    }
-
-    fn non_empty_model(value: &str) -> Option<String> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
         }
     }
 
@@ -1647,14 +1662,13 @@ impl StreamCheckService {
         config: &StreamCheckConfig,
     ) -> String {
         let effective_config = Self::merge_provider_config(provider, config);
-        Self::resolve_test_model(app_type, provider, &effective_config)
+        Self::resolve_test_model(app_type, provider, &effective_config, None)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{ProviderMeta, ProviderTestConfig};
 
     fn make_provider(settings_config: serde_json::Value) -> Provider {
         Provider::with_id(
@@ -1684,6 +1698,53 @@ mod tests {
             "api": "openai-completions",
         }));
         assert!(!StreamCheckService::additive_app_uses_auth_header(&p));
+    }
+
+    #[test]
+    fn test_custom_user_agent_trims_and_filters_empty() {
+        use crate::provider::ProviderMeta;
+
+        let mut p = make_provider(serde_json::json!({
+            "baseUrl": "https://api.kimi.com/coding",
+            "apiKey": "k",
+        }));
+
+        // 未设置 meta → None
+        assert!(StreamCheckService::custom_user_agent(&p).is_none());
+
+        // 带首尾空格的 UA → 去空格后返回合法 HeaderValue
+        p.meta = Some(ProviderMeta {
+            custom_user_agent: Some("  claude-cli/2.1.161  ".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            StreamCheckService::custom_user_agent(&p)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "claude-cli/2.1.161"
+        );
+
+        // 纯空白 → 视为未设置（与 forwarder 路径口径一致）
+        p.meta = Some(ProviderMeta {
+            custom_user_agent: Some("   ".to_string()),
+            ..Default::default()
+        });
+        assert!(StreamCheckService::custom_user_agent(&p).is_none());
+
+        // 非 ASCII 字符其实合法（UTF-8 字节均 ≥ 0x80，HeaderValue 按字节放行）→ 应返回 Some
+        p.meta = Some(ProviderMeta {
+            custom_user_agent: Some("claude-cli/2.1.161 \u{4e2d}".to_string()),
+            ..Default::default()
+        });
+        assert!(StreamCheckService::custom_user_agent(&p).is_some());
+
+        // 含控制字符（内嵌换行）才非法 → None（静默忽略，与 forwarder 一致，不让 Stream Check 报错）
+        p.meta = Some(ProviderMeta {
+            custom_user_agent: Some("claude-cli/2.1.161\nX".to_string()),
+            ..Default::default()
+        });
+        assert!(StreamCheckService::custom_user_agent(&p).is_none());
     }
 
     #[test]
@@ -1799,78 +1860,6 @@ mod tests {
         assert!(StreamCheckService::should_retry("request timed out"));
         assert!(StreamCheckService::should_retry("connection abort"));
         assert!(!StreamCheckService::should_retry("API Key invalid"));
-
-        assert!(StreamCheckService::should_retry_http_status(429));
-        assert!(StreamCheckService::should_retry_http_status(500));
-        assert!(StreamCheckService::should_retry_http_status(502));
-        assert!(StreamCheckService::should_retry_http_status(503));
-        assert!(StreamCheckService::should_retry_http_status(504));
-        assert!(!StreamCheckService::should_retry_http_status(400));
-        assert!(!StreamCheckService::should_retry_http_status(401));
-        assert!(!StreamCheckService::should_retry_http_status(403));
-        assert!(!StreamCheckService::should_retry_http_status(404));
-    }
-
-    #[test]
-    fn test_resolve_test_model_uses_global_codex_test_model_before_runtime_model() {
-        let provider = make_provider(serde_json::json!({
-            "config": r#"model = "runtime-model"
-model_provider = "custom"
-
-[model_providers.custom]
-name = "custom"
-wire_api = "responses"
-base_url = "https://example.com/v1""#
-        }));
-        let config = StreamCheckConfig {
-            codex_model: "global-test-model@low".to_string(),
-            ..StreamCheckConfig::default()
-        };
-
-        assert_eq!(
-            StreamCheckService::resolve_effective_test_model(&AppType::Codex, &provider, &config),
-            "global-test-model@low"
-        );
-    }
-
-    #[test]
-    fn test_resolve_test_model_uses_provider_test_model_before_global_config() {
-        let mut provider = make_provider(serde_json::json!({
-            "config": r#"model = "runtime-model""#
-        }));
-        provider.meta = Some(ProviderMeta {
-            test_config: Some(ProviderTestConfig {
-                enabled: true,
-                test_model: Some("provider-test-model".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        let config = StreamCheckConfig {
-            codex_model: "global-test-model".to_string(),
-            ..StreamCheckConfig::default()
-        };
-
-        assert_eq!(
-            StreamCheckService::resolve_effective_test_model(&AppType::Codex, &provider, &config),
-            "provider-test-model"
-        );
-    }
-
-    #[test]
-    fn test_resolve_test_model_falls_back_to_runtime_model_when_test_models_are_empty() {
-        let provider = make_provider(serde_json::json!({
-            "config": r#"model = "runtime-model""#
-        }));
-        let config = StreamCheckConfig {
-            codex_model: "  ".to_string(),
-            ..StreamCheckConfig::default()
-        };
-
-        assert_eq!(
-            StreamCheckService::resolve_effective_test_model(&AppType::Codex, &provider, &config),
-            "runtime-model"
-        );
     }
 
     #[test]

@@ -196,6 +196,30 @@ export const normalizeProviderLoadLimitsForSave = (
   };
 };
 
+export const normalizeProviderTestConfigForSave = (
+  config: ProviderTestConfig,
+): ProviderTestConfig | undefined => {
+  if (!config.enabled) {
+    return undefined;
+  }
+
+  const testModel = config.testModel?.trim();
+  const testPrompt = config.testPrompt?.trim();
+
+  return {
+    enabled: true,
+    ...(config.timeoutSecs !== undefined
+      ? { timeoutSecs: config.timeoutSecs }
+      : {}),
+    ...(config.degradedThresholdMs !== undefined
+      ? { degradedThresholdMs: config.degradedThresholdMs }
+      : {}),
+    ...(config.maxRetries !== undefined ? { maxRetries: config.maxRetries } : {}),
+    ...(testModel ? { testModel } : {}),
+    ...(testPrompt ? { testPrompt } : {}),
+  };
+};
+
 const normalizeCodexChatReasoningForSave = (
   value?: CodexChatReasoning,
 ): CodexChatReasoning | undefined => {
@@ -380,6 +404,7 @@ function ProviderFormFull({
       ),
     });
     setCodexChatReasoning(initialData?.meta?.codexChatReasoning ?? {});
+    setCustomUserAgent(initialData?.meta?.customUserAgent ?? "");
   }, [appId, initialData, supportsFullUrl]);
 
   const defaultValues: ProviderFormData = useMemo(
@@ -473,6 +498,8 @@ function ProviderFormFull({
     defaultSonnetModelName,
     defaultOpusModel,
     defaultOpusModelName,
+    defaultFableModel,
+    defaultFableModelName,
     handleModelChange,
   } = useModelState({
     settingsConfig: form.getValues("settingsConfig"),
@@ -534,6 +561,9 @@ function ProviderFormFull({
     useState<CodexChatReasoning>(
       () => initialData?.meta?.codexChatReasoning ?? {},
     );
+  const [customUserAgent, setCustomUserAgent] = useState<string>(
+    () => initialData?.meta?.customUserAgent ?? "",
+  );
 
   const {
     codexAuth,
@@ -1427,7 +1457,11 @@ function ProviderFormFull({
         localCodexApiFormat === "openai_chat"
           ? normalizeCodexChatReasoningForSave(codexChatReasoning)
           : undefined,
-      testConfig: testConfig.enabled ? testConfig : undefined,
+      customUserAgent:
+        (appId === "claude" || appId === "codex") && category !== "official"
+          ? customUserAgent.trim() || undefined
+          : undefined,
+      testConfig: normalizeProviderTestConfigForSave(testConfig),
       costMultiplier: pricingConfig.enabled
         ? pricingConfig.costMultiplier
         : undefined,
@@ -2042,6 +2076,8 @@ function ProviderFormFull({
               defaultSonnetModelName={defaultSonnetModelName}
               defaultOpusModel={defaultOpusModel}
               defaultOpusModelName={defaultOpusModelName}
+              defaultFableModel={defaultFableModel}
+              defaultFableModelName={defaultFableModelName}
               onModelChange={handleModelChange}
               speedTestEndpoints={speedTestEndpoints}
               apiFormat={localApiFormat}
@@ -2050,6 +2086,8 @@ function ProviderFormFull({
               onApiKeyFieldChange={handleApiKeyFieldChange}
               isFullUrl={localIsFullUrl}
               onFullUrlChange={setLocalIsFullUrl}
+              customUserAgent={customUserAgent}
+              onCustomUserAgentChange={setCustomUserAgent}
             />
           )}
 
@@ -2082,6 +2120,8 @@ function ProviderFormFull({
               catalogModels={codexCatalogModels}
               onCatalogModelsChange={setCodexCatalogModels}
               speedTestEndpoints={speedTestEndpoints}
+              customUserAgent={customUserAgent}
+              onCustomUserAgentChange={setCustomUserAgent}
             />
           )}
 

@@ -1,4 +1,6 @@
-//! 流式健康检查命令
+//! 流式模型测试命令
+//!
+//! 通过发送真实模型请求验证 provider 是否可用，但不会修改故障转移熔断器状态。
 
 use crate::app_config::AppType;
 use crate::commands::copilot::CopilotAuthState;
@@ -10,13 +12,14 @@ use crate::store::AppState;
 use std::collections::HashSet;
 use tauri::State;
 
-/// 流式健康检查（单个供应商）
+/// 连通性检查（单个供应商）
 #[tauri::command]
 pub async fn stream_check_provider(
     state: State<'_, AppState>,
     copilot_state: State<'_, CopilotAuthState>,
     app_type: AppType,
     provider_id: String,
+    model_override: Option<String>,
 ) -> Result<StreamCheckResult, AppError> {
     let config = state.db.get_stream_check_config()?;
 
@@ -33,6 +36,7 @@ pub async fn stream_check_provider(
         &config,
         &copilot_state,
         auth_override.as_ref(),
+        model_override.as_deref(),
     )
     .await?;
     let result = StreamCheckService::check_with_retry(
@@ -42,6 +46,7 @@ pub async fn stream_check_provider(
         auth_override,
         base_url_override,
         claude_api_format_override,
+        model_override,
     )
     .await?;
 
@@ -54,7 +59,7 @@ pub async fn stream_check_provider(
     Ok(result)
 }
 
-/// 批量流式健康检查
+/// 批量连通性检查
 #[tauri::command]
 pub async fn stream_check_all_providers(
     state: State<'_, AppState>,
@@ -65,7 +70,6 @@ pub async fn stream_check_all_providers(
     let config = state.db.get_stream_check_config()?;
     let providers = state.db.get_all_providers(app_type.as_str())?;
 
-    let mut results = Vec::new();
     let allowed_ids: Option<HashSet<String>> = if proxy_targets_only {
         let mut ids = HashSet::new();
         if let Ok(Some(current_id)) = state.db.get_current_provider(app_type.as_str()) {
@@ -81,6 +85,7 @@ pub async fn stream_check_all_providers(
         None
     };
 
+    let mut results = Vec::new();
     for (id, provider) in providers {
         if let Some(ids) = &allowed_ids {
             if !ids.contains(&id) {
@@ -97,6 +102,7 @@ pub async fn stream_check_all_providers(
             &config,
             &copilot_state,
             auth_override.as_ref(),
+            None,
         )
         .await
         .unwrap_or_else(|e| {
@@ -114,6 +120,7 @@ pub async fn stream_check_all_providers(
             auth_override,
             base_url_override,
             claude_api_format_override,
+            None,
         )
         .await
         .unwrap_or_else(|e| {
@@ -147,19 +154,50 @@ pub async fn stream_check_all_providers(
     Ok(results)
 }
 
-/// 获取流式检查配置
+/// 获取连通性检查配置
 #[tauri::command]
 pub fn get_stream_check_config(state: State<'_, AppState>) -> Result<StreamCheckConfig, AppError> {
     state.db.get_stream_check_config()
 }
 
-/// 保存流式检查配置
+/// 保存连通性检查配置
 #[tauri::command]
 pub fn save_stream_check_config(
     state: State<'_, AppState>,
     config: StreamCheckConfig,
 ) -> Result<(), AppError> {
     state.db.save_stream_check_config(&config)
+}
+
+/// Copilot 供应商的 base_url 需要从 OAuth 管理器动态解析（按账号或默认端点）。
+/// `is_full_url` 的供应商已是完整地址，无需解析。
+async fn resolve_copilot_base_url_override(
+    provider: &crate::provider::Provider,
+    copilot_state: &State<'_, CopilotAuthState>,
+) -> Result<Option<String>, AppError> {
+    let is_copilot = is_copilot_provider(provider);
+    let is_full_url = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.is_full_url)
+        .unwrap_or(false);
+
+    if !is_copilot || is_full_url {
+        return Ok(None);
+    }
+
+    let auth_manager = copilot_state.0.read().await;
+    let account_id = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.managed_account_id_for("github_copilot"));
+
+    let endpoint = match account_id.as_deref() {
+        Some(id) => auth_manager.get_api_endpoint(id).await,
+        None => auth_manager.get_default_api_endpoint().await,
+    };
+
+    Ok(Some(endpoint))
 }
 
 async fn resolve_copilot_auth_override(
@@ -195,35 +233,6 @@ async fn resolve_copilot_auth_override(
     )))
 }
 
-async fn resolve_copilot_base_url_override(
-    provider: &crate::provider::Provider,
-    copilot_state: &State<'_, CopilotAuthState>,
-) -> Result<Option<String>, AppError> {
-    let is_copilot = is_copilot_provider(provider);
-    let is_full_url = provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.is_full_url)
-        .unwrap_or(false);
-
-    if !is_copilot || is_full_url {
-        return Ok(None);
-    }
-
-    let auth_manager = copilot_state.0.read().await;
-    let account_id = provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.managed_account_id_for("github_copilot"));
-
-    let endpoint = match account_id.as_deref() {
-        Some(id) => auth_manager.get_api_endpoint(id).await,
-        None => auth_manager.get_default_api_endpoint().await,
-    };
-
-    Ok(Some(endpoint))
-}
-
 fn is_copilot_provider(provider: &crate::provider::Provider) -> bool {
     provider
         .meta
@@ -244,6 +253,7 @@ async fn resolve_claude_api_format_override(
     config: &StreamCheckConfig,
     copilot_state: &State<'_, CopilotAuthState>,
     auth_override: Option<&crate::proxy::providers::AuthInfo>,
+    model_override: Option<&str>,
 ) -> Result<Option<String>, AppError> {
     if *app_type != AppType::Claude {
         return Ok(None);
@@ -256,7 +266,13 @@ async fn resolve_claude_api_format_override(
         return Ok(None);
     }
 
-    let model_id = StreamCheckService::resolve_effective_test_model(app_type, provider, config);
+    let model_id = model_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            StreamCheckService::resolve_effective_test_model(app_type, provider, config)
+        });
     let auth_manager = copilot_state.0.read().await;
     let account_id = provider
         .meta
