@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { parse as parseToml } from "smol-toml";
 import {
   extractCodexBaseUrl,
   extractCodexExperimentalBearerToken,
@@ -83,6 +84,61 @@ describe("Codex TOML utils", () => {
       '[model_providers.custom]\nname = "custom"\nwire_api = "responses"\nbase_url = "https://api.example.com/v1"',
     );
     expect(extractCodexBaseUrl(output)).toBe("https://api.example.com/v1");
+  });
+
+  it("escapes JSON connection strings when writing base_url", () => {
+    const input = [
+      'model_provider = "custom"',
+      'model = "gpt-5.5"',
+      "",
+      "[model_providers.custom]",
+      'name = "custom"',
+      'wire_api = "responses"',
+      "",
+    ].join("\n");
+    const connectionString = JSON.stringify({
+      type: "newapi_channel_conn",
+      key: "sk-test",
+      url: "https://api.lucky.example",
+    });
+
+    const output = setCodexBaseUrl(input, connectionString);
+    const parsed = parseToml(output) as Record<string, any>;
+
+    expect(output).toContain(
+      'base_url = "{\\"type\\":\\"newapi_channel_conn\\",\\"key\\":\\"sk-test\\",\\"url\\":\\"https://api.lucky.example\\"}"',
+    );
+    expect(parsed.model_providers.custom.base_url).toBe(connectionString);
+    expect(extractCodexBaseUrl(output)).toBe(connectionString);
+
+    const updated = setCodexBaseUrl(output, connectionString);
+    expect(updated.match(/base_url\s*=/g)).toHaveLength(1);
+    expect(extractCodexBaseUrl(updated)).toBe(connectionString);
+  });
+
+  it("repairs malformed JSON connection strings in base_url", () => {
+    const connectionString = JSON.stringify({
+      type: "newapi_channel_conn",
+      key: "sk-test",
+      url: "https://api.lucky.example",
+    });
+    const malformed = [
+      'model_provider = "custom"',
+      'model = "gpt-5.5"',
+      "",
+      "[model_providers.custom]",
+      'name = "custom"',
+      `base_url = "${connectionString}"`,
+      'wire_api = "responses"',
+      "",
+    ].join("\n");
+
+    const repaired = setCodexBaseUrl(malformed, connectionString);
+    const parsed = parseToml(repaired) as Record<string, any>;
+
+    expect(repaired.match(/base_url\s*=/g)).toHaveLength(1);
+    expect(parsed.model_providers.custom.base_url).toBe(connectionString);
+    expect(extractCodexBaseUrl(repaired)).toBe(connectionString);
   });
 
   it("recovers a single misplaced base_url from another section", () => {

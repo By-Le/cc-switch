@@ -8,9 +8,23 @@ import { ProviderList } from "@/components/providers/ProviderList";
 const useDragSortMock = vi.fn();
 const useSortableMock = vi.fn();
 const providerCardRenderSpy = vi.fn();
+const checkProviderMock = vi.fn();
+const settingsApiGetMock = vi.fn();
+const settingsApiSaveMock = vi.fn();
+const getStreamCheckConfigMock = vi.fn();
 let autoFailoverEnabled = false;
 let failoverQueue: Array<{ providerId: string; providerName: string }> = [];
 let lastStreamCheckResults: Record<string, unknown> = {};
+
+const defaultStreamCheckConfig = {
+  timeoutSecs: 15,
+  maxRetries: 0,
+  degradedThresholdMs: 3000,
+  claudeModel: "claude-haiku-4-5-20251001",
+  codexModel: "gpt-5.5",
+  geminiModel: "gemini-3.5-flash",
+  testPrompt: "Who are you?",
+};
 
 vi.mock("@/hooks/useDragSort", () => ({
   useDragSort: (...args: unknown[]) => useDragSortMock(...args),
@@ -26,6 +40,7 @@ vi.mock("@/components/providers/ProviderCard", () => ({
       onDelete,
       onDuplicate,
       onConfigureUsage,
+      onTest,
     } = props;
 
     return (
@@ -60,6 +75,12 @@ vi.mock("@/components/providers/ProviderCard", () => ({
         >
           delete
         </button>
+        <button
+          data-testid={`test-${provider.id}`}
+          onClick={() => onTest?.(provider)}
+        >
+          test
+        </button>
         <span data-testid={`is-current-${provider.id}`}>
           {props.isCurrent ? "current" : "inactive"}
         </span>
@@ -80,6 +101,18 @@ vi.mock("@/components/providers/ProviderCard", () => ({
   },
 }));
 
+vi.mock("@/lib/api/settings", () => ({
+  settingsApi: {
+    get: (...args: unknown[]) => settingsApiGetMock(...args),
+    save: (...args: unknown[]) => settingsApiSaveMock(...args),
+  },
+}));
+
+vi.mock("@/lib/api/model-test", () => ({
+  getStreamCheckConfig: (...args: unknown[]) =>
+    getStreamCheckConfigMock(...args),
+}));
+
 vi.mock("@/components/UsageFooter", () => ({
   default: () => <div data-testid="usage-footer" />,
 }));
@@ -96,7 +129,7 @@ vi.mock("@dnd-kit/sortable", async () => {
 // Mock hooks that use QueryClient
 vi.mock("@/hooks/useStreamCheck", () => ({
   useStreamCheck: () => ({
-    checkProvider: vi.fn(),
+    checkProvider: checkProviderMock,
     isChecking: () => false,
     lastResults: lastStreamCheckResults,
   }),
@@ -127,6 +160,8 @@ function renderWithQueryClient(ui: ReactElement) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  queryClient.setQueryData(["settings"], { streamCheckConfirmed: true });
+  queryClient.setQueryData(["streamCheckConfig"], defaultStreamCheckConfig);
 
   return render(
     <QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>,
@@ -137,6 +172,10 @@ beforeEach(() => {
   useDragSortMock.mockReset();
   useSortableMock.mockReset();
   providerCardRenderSpy.mockClear();
+  checkProviderMock.mockReset();
+  settingsApiGetMock.mockReset();
+  settingsApiSaveMock.mockReset();
+  getStreamCheckConfigMock.mockReset();
 
   useSortableMock.mockImplementation(({ id }: { id: string }) => ({
     setNodeRef: vi.fn(),
@@ -155,6 +194,9 @@ beforeEach(() => {
   autoFailoverEnabled = false;
   failoverQueue = [];
   lastStreamCheckResults = {};
+  settingsApiGetMock.mockResolvedValue({ streamCheckConfirmed: true });
+  settingsApiSaveMock.mockResolvedValue(true);
+  getStreamCheckConfigMock.mockResolvedValue(defaultStreamCheckConfig);
 });
 
 describe("ProviderList Component", () => {
@@ -477,6 +519,101 @@ describe("ProviderList Component", () => {
 
     expect(providerCardRenderSpy.mock.calls[0][0].lastTestResult).toBe(
       latestResult,
+    );
+  });
+
+  it("shows selectable test models and uses the selected option", async () => {
+    const provider = createProvider({
+      id: "codex-a",
+      name: "Codex A",
+      settingsConfig: {
+        config: 'model = "runtime-model"',
+        modelCatalog: {
+          models: [
+            { model: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash" },
+            { model: "gpt-5.5" },
+          ],
+        },
+      },
+    });
+
+    useDragSortMock.mockReturnValue({
+      sortedProviders: [provider],
+      sensors: [],
+      handleDragEnd: vi.fn(),
+    });
+
+    renderWithQueryClient(
+      <ProviderList
+        providers={{ "codex-a": provider }}
+        currentProviderId=""
+        appId="codex"
+        onSwitch={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onDuplicate={vi.fn()}
+        onOpenWebsite={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("test-codex-a"));
+
+    expect(await screen.findByText("选择测试模型")).toBeInTheDocument();
+    expect(screen.getByText("DeepSeek V4 Flash")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "DeepSeek V4 Flash" }));
+    expect(
+      screen.getByDisplayValue("deepseek-v4-flash"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "开始测试" }));
+
+    expect(checkProviderMock).toHaveBeenCalledWith(
+      "codex-a",
+      "Codex A",
+      "deepseek-v4-flash",
+    );
+  });
+
+  it("accepts manual test model input", async () => {
+    const provider = createProvider({
+      id: "codex-b",
+      name: "Codex B",
+      settingsConfig: {
+        config: 'model = "runtime-model"',
+      },
+    });
+
+    useDragSortMock.mockReturnValue({
+      sortedProviders: [provider],
+      sensors: [],
+      handleDragEnd: vi.fn(),
+    });
+
+    renderWithQueryClient(
+      <ProviderList
+        providers={{ "codex-b": provider }}
+        currentProviderId=""
+        appId="codex"
+        onSwitch={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onDuplicate={vi.fn()}
+        onOpenWebsite={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("test-codex-b"));
+    await screen.findByText("选择测试模型");
+
+    const input = screen.getByPlaceholderText("输入模型名，或从上方选择");
+    fireEvent.change(input, { target: { value: "manual-model-x" } });
+    fireEvent.click(screen.getByRole("button", { name: "开始测试" }));
+
+    expect(checkProviderMock).toHaveBeenCalledWith(
+      "codex-b",
+      "Codex B",
+      "manual-model-x",
     );
   });
 });

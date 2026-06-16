@@ -400,18 +400,20 @@ export const hasTomlCommonConfigSnippet = (
 
 const TOML_SECTION_HEADER_PATTERN = /^\s*\[([^\]\r\n]+)\]\s*$/;
 const TOML_BASE_URL_PATTERN =
-  /^\s*base_url\s*=\s*(["'])([^"'\r\n]+)\1\s*(?:#.*)?$/;
+  /^\s*base_url\s*=\s*((?:"(?:\\.|[^"\\\r\n])*")|'[^'\r\n]*')\s*(?:#.*)?$/;
+const TOML_BASE_URL_LOOSE_PATTERN = /^\s*base_url\s*=.*$/;
 const TOML_EXPERIMENTAL_BEARER_TOKEN_PATTERN =
-  /^\s*experimental_bearer_token\s*=\s*(["'])([^"'\r\n]+)\1\s*(?:#.*)?$/;
+  /^\s*experimental_bearer_token\s*=\s*((?:"(?:\\.|[^"\\\r\n])*")|'[^'\r\n]*')\s*(?:#.*)?$/;
 const TOML_EXPERIMENTAL_BEARER_TOKEN_REPLACE_PATTERN =
   /^(\s*experimental_bearer_token\s*=\s*)(?:"(?:\\.|[^"\\\r\n])*"|'[^'\r\n]*')(\s*(?:#.*)?)$/;
-const TOML_MODEL_PATTERN = /^\s*model\s*=\s*(["'])([^"'\r\n]+)\1\s*(?:#.*)?$/;
+const TOML_MODEL_PATTERN =
+  /^\s*model\s*=\s*((?:"(?:\\.|[^"\\\r\n])*")|'[^'\r\n]*')\s*(?:#.*)?$/;
 const TOML_WIRE_API_PATTERN =
-  /^\s*wire_api\s*=\s*(["'])([^"'\r\n]+)\1\s*(?:#.*)?$/;
+  /^\s*wire_api\s*=\s*((?:"(?:\\.|[^"\\\r\n])*")|'[^'\r\n]*')\s*(?:#.*)?$/;
 const TOML_MODEL_PROVIDER_LINE_PATTERN =
-  /^\s*model_provider\s*=\s*(["'])([^"'\r\n]+)\1\s*(?:#.*)?$/;
+  /^\s*model_provider\s*=\s*((?:"(?:\\.|[^"\\\r\n])*")|'[^'\r\n]*')\s*(?:#.*)?$/;
 const TOML_PROVIDER_NAME_PATTERN =
-  /^\s*name\s*=\s*(["'])([^"'\r\n]+)\1\s*(?:#.*)?$/;
+  /^\s*name\s*=\s*((?:"(?:\\.|[^"\\\r\n])*")|'[^'\r\n]*')\s*(?:#.*)?$/;
 const TOML_PROVIDER_NAME_REPLACE_PATTERN =
   /^(\s*name\s*=\s*)(?:"(?:\\.|[^"\\\r\n])*"|'[^'\r\n]*')(\s*(?:#.*)?)$/;
 const TOML_GOALS_FEATURE_PATTERN = /^\s*goals\s*=\s*(true|false)\s*(?:#.*)?$/;
@@ -502,6 +504,15 @@ const getTomlSectionInsertIndex = (
   return insertIndex;
 };
 
+const parseTomlStringLiteral = (literal: string): string | undefined => {
+  try {
+    const parsed = parseToml(`value = ${literal}`) as Record<string, any>;
+    return typeof parsed.value === "string" ? parsed.value : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 const getCodexModelProviderName = (configText: string): string | undefined => {
   const normalized = normalizeTomlText(configText);
   try {
@@ -519,7 +530,9 @@ const getCodexModelProviderName = (configText: string): string | undefined => {
   const index = getTopLevelModelProviderLineIndex(lines);
   if (index === -1) return undefined;
   const match = lines[index].match(TOML_MODEL_PROVIDER_LINE_PATTERN);
-  const providerName = match?.[2]?.trim();
+  const providerName = match?.[1]
+    ? parseTomlStringLiteral(match[1])?.trim()
+    : undefined;
   return providerName || undefined;
 };
 
@@ -553,11 +566,15 @@ const findTomlAssignmentInRange = (
 ): TomlAssignmentMatch | undefined => {
   for (let index = startIndex; index < endIndex; index += 1) {
     const match = lines[index].match(pattern);
-    if (match?.[2]) {
+    if (match?.[1]) {
+      const value = parseTomlStringLiteral(match[1]);
+      if (value === undefined) {
+        continue;
+      }
       return {
         index,
         sectionName,
-        value: match[2],
+        value,
       };
     }
   }
@@ -580,6 +597,22 @@ const findTomlLineInRange = (
   return -1;
 };
 
+const findLooseTomlAssignmentLineInRange = (
+  lines: string[],
+  loosePattern: RegExp,
+  strictPattern: RegExp,
+  startIndex: number,
+  endIndex: number,
+): number => {
+  for (let index = startIndex; index < endIndex; index += 1) {
+    const line = lines[index];
+    if (strictPattern.test(line)) continue;
+    if (loosePattern.test(line)) return index;
+  }
+
+  return -1;
+};
+
 const findTomlAssignments = (
   lines: string[],
   pattern: RegExp,
@@ -595,14 +628,19 @@ const findTomlAssignments = (
     }
 
     const match = line.match(pattern);
-    if (!match?.[2]) {
+    if (!match?.[1]) {
+      return;
+    }
+
+    const value = parseTomlStringLiteral(match[1]);
+    if (value === undefined) {
       return;
     }
 
     assignments.push({
       index,
       sectionName: currentSectionName,
-      value: match[2],
+      value,
     });
   });
 
@@ -1237,9 +1275,22 @@ export const setCodexBaseUrl = (
             targetSectionName,
           )
         : undefined;
+      const malformedTargetIndex = sectionRange
+        ? findLooseTomlAssignmentLineInRange(
+            lines,
+            TOML_BASE_URL_LOOSE_PATTERN,
+            TOML_BASE_URL_PATTERN,
+            sectionRange.bodyStartIndex,
+            sectionRange.bodyEndIndex,
+          )
+        : -1;
 
       if (targetMatch) {
         lines.splice(targetMatch.index, 1);
+        return finalizeTomlText(lines);
+      }
+      if (malformedTargetIndex !== -1) {
+        lines.splice(malformedTargetIndex, 1);
         return finalizeTomlText(lines);
       }
     }
@@ -1253,7 +1304,7 @@ export const setCodexBaseUrl = (
   }
 
   const normalizedUrl = trimmed.replace(/\s+/g, "");
-  const replacementLine = `base_url = "${normalizedUrl}"`;
+  const replacementLine = `base_url = ${tomlBasicString(normalizedUrl)}`;
 
   if (targetSectionName) {
     let targetSectionRange = getTomlSectionRange(lines, targetSectionName);
@@ -1266,9 +1317,22 @@ export const setCodexBaseUrl = (
           targetSectionName,
         )
       : undefined;
+    const malformedTargetIndex = targetSectionRange
+      ? findLooseTomlAssignmentLineInRange(
+          lines,
+          TOML_BASE_URL_LOOSE_PATTERN,
+          TOML_BASE_URL_PATTERN,
+          targetSectionRange.bodyStartIndex,
+          targetSectionRange.bodyEndIndex,
+        )
+      : -1;
 
     if (targetMatch) {
       lines[targetMatch.index] = replacementLine;
+      return finalizeTomlText(lines);
+    }
+    if (malformedTargetIndex !== -1) {
+      lines[malformedTargetIndex] = replacementLine;
       return finalizeTomlText(lines);
     }
 
@@ -1297,8 +1361,19 @@ export const setCodexBaseUrl = (
     0,
     topLevelEndIndex,
   );
+  const malformedTopLevelIndex = findLooseTomlAssignmentLineInRange(
+    lines,
+    TOML_BASE_URL_LOOSE_PATTERN,
+    TOML_BASE_URL_PATTERN,
+    0,
+    topLevelEndIndex,
+  );
   if (topLevelMatch) {
     lines[topLevelMatch.index] = replacementLine;
+    return finalizeTomlText(lines);
+  }
+  if (malformedTopLevelIndex !== -1) {
+    lines[malformedTopLevelIndex] = replacementLine;
     return finalizeTomlText(lines);
   }
 

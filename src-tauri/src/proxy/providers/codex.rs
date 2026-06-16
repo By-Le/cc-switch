@@ -397,6 +397,17 @@ fn extract_codex_base_url_from_toml(config_text: &str) -> Option<String> {
     crate::codex_config::extract_codex_base_url(config_text)
 }
 
+fn normalize_codex_base_url_value(value: &str) -> String {
+    crate::codex_config::extract_codex_connection_url(value)
+        .unwrap_or_else(|| value.trim().to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn extract_codex_connection_key_value(value: &str) -> Option<String> {
+    crate::codex_config::extract_codex_connection_key(value)
+}
+
 impl CodexAdapter {
     pub fn new() -> Self {
         Self
@@ -443,6 +454,16 @@ impl CodexAdapter {
             return Some(key.to_string());
         }
 
+        if let Some(key) = provider
+            .settings_config
+            .get("base_url")
+            .or_else(|| provider.settings_config.get("baseURL"))
+            .and_then(|v| v.as_str())
+            .and_then(extract_codex_connection_key_value)
+        {
+            return Some(key);
+        }
+
         // 4. 尝试从 config 对象中获取
         if let Some(config) = provider.settings_config.get("config") {
             if let Some(key) = config
@@ -455,9 +476,16 @@ impl CodexAdapter {
                 return Some(key.to_string());
             }
 
+            if let Some(key) = config
+                .get("base_url")
+                .and_then(|v| v.as_str())
+                .and_then(extract_codex_connection_key_value)
+            {
+                return Some(key);
+            }
+
             if let Some(config_str) = config.as_str() {
-                if let Some(key) =
-                    crate::codex_config::extract_codex_experimental_bearer_token(config_str)
+                if let Some(key) = crate::codex_config::extract_codex_api_key(None, Some(config_str))
                 {
                     return Some(key);
                 }
@@ -486,7 +514,7 @@ impl ProviderAdapter for CodexAdapter {
             .get("base_url")
             .and_then(|v| v.as_str())
         {
-            return Ok(url.trim_end_matches('/').to_string());
+            return Ok(normalize_codex_base_url_value(url));
         }
 
         // 2. 尝试 baseURL
@@ -495,28 +523,18 @@ impl ProviderAdapter for CodexAdapter {
             .get("baseURL")
             .and_then(|v| v.as_str())
         {
-            return Ok(url.trim_end_matches('/').to_string());
+            return Ok(normalize_codex_base_url_value(url));
         }
 
         // 3. 尝试从 config 对象中获取
         if let Some(config) = provider.settings_config.get("config") {
             if let Some(url) = config.get("base_url").and_then(|v| v.as_str()) {
-                return Ok(url.trim_end_matches('/').to_string());
+                return Ok(normalize_codex_base_url_value(url));
             }
 
-            // 尝试解析 TOML 字符串格式
             if let Some(config_str) = config.as_str() {
-                if let Some(start) = config_str.find("base_url = \"") {
-                    let rest = &config_str[start + 12..];
-                    if let Some(end) = rest.find('"') {
-                        return Ok(rest[..end].trim_end_matches('/').to_string());
-                    }
-                }
-                if let Some(start) = config_str.find("base_url = '") {
-                    let rest = &config_str[start + 12..];
-                    if let Some(end) = rest.find('\'') {
-                        return Ok(rest[..end].trim_end_matches('/').to_string());
-                    }
+                if let Some(url) = extract_codex_base_url_from_toml(config_str) {
+                    return Ok(url);
                 }
             }
         }
@@ -610,6 +628,42 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_base_url_direct_json_connection_string() {
+        let adapter = CodexAdapter::new();
+        let connection = serde_json::to_string(&json!({
+            "type": "newapi_channel_conn",
+            "key": "sk-json-key",
+            "url": "https://api.lucky.example/v1/"
+        }))
+        .unwrap();
+        let provider = create_provider(json!({
+            "base_url": connection
+        }));
+
+        let url = adapter.extract_base_url(&provider).unwrap();
+        assert_eq!(url, "https://api.lucky.example/v1");
+    }
+
+    #[test]
+    fn test_extract_base_url_from_escaped_toml_json_connection_string() {
+        let adapter = CodexAdapter::new();
+        let connection = serde_json::to_string(&json!({
+            "type": "newapi_channel_conn",
+            "key": "sk-json-key",
+            "url": "https://api.lucky.example/v1/"
+        }))
+        .unwrap();
+        let provider = create_provider(json!({
+            "config": format!(
+                "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = {connection:?}\n"
+            )
+        }));
+
+        let url = adapter.extract_base_url(&provider).unwrap();
+        assert_eq!(url, "https://api.lucky.example/v1");
+    }
+
+    #[test]
     fn test_extract_auth_from_auth_field() {
         let adapter = CodexAdapter::new();
         let provider = create_provider(json!({
@@ -639,6 +693,26 @@ experimental_bearer_token = "sk-config-key"
 
         let auth = adapter.extract_auth(&provider).unwrap();
         assert_eq!(auth.api_key, "sk-config-key");
+        assert_eq!(auth.strategy, AuthStrategy::Bearer);
+    }
+
+    #[test]
+    fn test_extract_auth_from_json_connection_string() {
+        let adapter = CodexAdapter::new();
+        let connection = serde_json::to_string(&json!({
+            "type": "newapi_channel_conn",
+            "key": "sk-json-key",
+            "url": "https://api.lucky.example/v1"
+        }))
+        .unwrap();
+        let provider = create_provider(json!({
+            "config": format!(
+                "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = {connection:?}\n"
+            )
+        }));
+
+        let auth = adapter.extract_auth(&provider).unwrap();
+        assert_eq!(auth.api_key, "sk-json-key");
         assert_eq!(auth.strategy, AuthStrategy::Bearer);
     }
 

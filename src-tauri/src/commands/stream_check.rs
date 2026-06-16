@@ -266,13 +266,12 @@ async fn resolve_claude_api_format_override(
         return Ok(None);
     }
 
-    let model_id = model_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| {
-            StreamCheckService::resolve_effective_test_model(app_type, provider, config)
-        });
+    let model_id = StreamCheckService::resolve_effective_test_model_with_override(
+        app_type,
+        provider,
+        config,
+        model_override,
+    );
     let auth_manager = copilot_state.0.read().await;
     let account_id = provider
         .meta

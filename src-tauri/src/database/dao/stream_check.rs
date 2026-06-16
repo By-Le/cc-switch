@@ -42,7 +42,8 @@ impl Database {
     /// 获取流式检查配置
     pub fn get_stream_check_config(&self) -> Result<StreamCheckConfig, AppError> {
         match self.get_setting("stream_check_config")? {
-            Some(json) => serde_json::from_str(&json)
+            Some(json) => serde_json::from_str::<StreamCheckConfig>(&json)
+                .map(StreamCheckConfig::normalize_legacy_probe_defaults)
                 .map_err(|e| AppError::Message(format!("解析配置失败: {e}"))),
             None => Ok(StreamCheckConfig::default()),
         }

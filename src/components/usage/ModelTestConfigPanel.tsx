@@ -13,6 +13,10 @@ import {
   type StreamCheckConfig,
 } from "@/lib/api/model-test";
 
+const DEFAULT_TIMEOUT_SECS = 15;
+const DEFAULT_MAX_RETRIES = 0;
+const DEFAULT_DEGRADED_THRESHOLD_MS = 3000;
+
 export function ModelTestConfigPanel() {
   const { t } = useTranslation();
   const [isLoading, setIsLoading] = useState(true);
@@ -20,9 +24,9 @@ export function ModelTestConfigPanel() {
   const [error, setError] = useState<string | null>(null);
   // 使用字符串状态以支持完全清空数字输入框
   const [config, setConfig] = useState({
-    timeoutSecs: "45",
-    maxRetries: "2",
-    degradedThresholdMs: "6000",
+    timeoutSecs: String(DEFAULT_TIMEOUT_SECS),
+    maxRetries: String(DEFAULT_MAX_RETRIES),
+    degradedThresholdMs: String(DEFAULT_DEGRADED_THRESHOLD_MS),
     claudeModel: "claude-haiku-4-5-20251001",
     codexModel: "gpt-5.5@low",
     geminiModel: "gemini-3.5-flash",
@@ -63,9 +67,12 @@ export function ModelTestConfigPanel() {
     try {
       setIsSaving(true);
       const parsed: StreamCheckConfig = {
-        timeoutSecs: parseNum(config.timeoutSecs, 45),
-        maxRetries: parseNum(config.maxRetries, 2),
-        degradedThresholdMs: parseNum(config.degradedThresholdMs, 6000),
+        timeoutSecs: parseNum(config.timeoutSecs, DEFAULT_TIMEOUT_SECS),
+        maxRetries: parseNum(config.maxRetries, DEFAULT_MAX_RETRIES),
+        degradedThresholdMs: parseNum(
+          config.degradedThresholdMs,
+          DEFAULT_DEGRADED_THRESHOLD_MS,
+        ),
         claudeModel: config.claudeModel,
         codexModel: config.codexModel,
         geminiModel: config.geminiModel,

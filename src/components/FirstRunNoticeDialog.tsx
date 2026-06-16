@@ -26,7 +26,7 @@ export function FirstRunNoticeDialog() {
   const handleAcknowledge = async () => {
     if (!settings) return;
     try {
-      const { webdavSync: _, ...rest } = settings;
+      const { webdavSync: _, s3Sync: _s3Sync, ...rest } = settings;
       await settingsApi.save({ ...rest, firstRunNoticeConfirmed: true });
       await queryClient.invalidateQueries({ queryKey: ["settings"] });
     } catch (error) {

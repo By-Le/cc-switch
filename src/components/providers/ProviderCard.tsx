@@ -89,11 +89,16 @@ function isOfficialProvider(provider: Provider, appId: AppId): boolean {
   if (appId === "codex") {
     // 无 OPENAI_API_KEY → 使用 Codex CLI 内置 OAuth（官方）
     const apiKey = config?.auth?.OPENAI_API_KEY;
+    const baseUrl =
+      typeof config?.config === "string"
+        ? extractCodexBaseUrl(config.config)
+        : undefined;
     const bearerToken =
       typeof config?.config === "string"
         ? extractCodexExperimentalBearerToken(config.config)
         : undefined;
     return (
+      !baseUrl &&
       !bearerToken &&
       (!apiKey || (typeof apiKey === "string" && apiKey.trim() === ""))
     );

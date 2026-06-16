@@ -200,9 +200,48 @@ pub fn extract_codex_auth_api_key(auth: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn extract_codex_connection_string_field(value: &str, field: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(value).ok()?;
+    let object = parsed.as_object()?;
+    let connection_type = object.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if connection_type != "newapi_channel_conn" {
+        return None;
+    }
+
+    object
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+pub fn extract_codex_connection_url(value: &str) -> Option<String> {
+    extract_codex_connection_string_field(value, "url")
+}
+
+pub fn extract_codex_connection_key(value: &str) -> Option<String> {
+    extract_codex_connection_string_field(value, "key")
+}
+
+fn normalize_codex_base_url(value: &str) -> Option<String> {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let resolved = extract_codex_connection_url(raw).unwrap_or_else(|| raw.to_string());
+    Some(resolved.trim_end_matches('/').to_string())
+}
+
 pub fn extract_codex_api_key(auth: Option<&Value>, config_text: Option<&str>) -> Option<String> {
     auth.and_then(extract_codex_auth_api_key)
         .or_else(|| config_text.and_then(extract_codex_experimental_bearer_token))
+        .or_else(|| {
+            config_text
+                .and_then(extract_codex_raw_base_url)
+                .and_then(|base_url| extract_codex_connection_key(&base_url))
+        })
 }
 
 /// Extract the upstream base URL from a Codex `config.toml` string.
@@ -213,6 +252,10 @@ pub fn extract_codex_api_key(auth: Option<&Value>, config_text: Option<&str>) ->
 /// (`getRecoverableBaseUrlAssignments`) excludes those too, and a leftover
 /// section unrelated to the active provider must not leak into `{{baseUrl}}`.
 pub fn extract_codex_base_url(config_text: &str) -> Option<String> {
+    extract_codex_raw_base_url(config_text).and_then(|url| normalize_codex_base_url(&url))
+}
+
+pub fn extract_codex_raw_base_url(config_text: &str) -> Option<String> {
     let doc = config_text.parse::<toml::Value>().ok()?;
 
     if let Some(active_provider) = doc.get("model_provider").and_then(|v| v.as_str()) {
@@ -1674,6 +1717,54 @@ experimental_bearer_token = "stale-table-key"
         assert_eq!(
             extract_codex_experimental_bearer_token(input).as_deref(),
             Some("top-level-key")
+        );
+    }
+
+    #[test]
+    fn extract_base_url_unwraps_json_connection_string() {
+        let connection = serde_json::to_string(&json!({
+            "type": "newapi_channel_conn",
+            "key": "sk-json-key",
+            "url": "https://api.lucky.example/v1/"
+        }))
+        .unwrap();
+        let config = format!(
+            r#"model_provider = "custom"
+
+[model_providers.custom]
+base_url = {connection:?}
+"#
+        );
+
+        assert_eq!(
+            extract_codex_raw_base_url(&config).as_deref(),
+            Some(connection.as_str())
+        );
+        assert_eq!(
+            extract_codex_base_url(&config).as_deref(),
+            Some("https://api.lucky.example/v1")
+        );
+    }
+
+    #[test]
+    fn extract_api_key_falls_back_to_json_connection_string_key() {
+        let connection = serde_json::to_string(&json!({
+            "type": "newapi_channel_conn",
+            "key": "sk-json-key",
+            "url": "https://api.lucky.example/v1"
+        }))
+        .unwrap();
+        let config = format!(
+            r#"model_provider = "custom"
+
+[model_providers.custom]
+base_url = {connection:?}
+"#
+        );
+
+        assert_eq!(
+            extract_codex_api_key(None, Some(&config)).as_deref(),
+            Some("sk-json-key")
         );
     }
 

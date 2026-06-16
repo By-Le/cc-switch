@@ -57,6 +57,7 @@ import {
 import { mergeProviderMeta } from "@/utils/providerMetaUtils";
 import {
   extractCodexWireApi,
+  setCodexBaseUrl,
   setCodexWireApi,
   setCodexModelName as setCodexModelNameInConfig,
 } from "@/utils/providerConfigUtils";
@@ -313,7 +314,7 @@ function ProviderFormFull({
   const handleCommonConfigConfirm = async () => {
     try {
       if (settingsData) {
-        const { webdavSync: _, ...rest } = settingsData;
+        const { webdavSync: _, s3Sync: _s3Sync, ...rest } = settingsData;
         await settingsApi.save({ ...rest, commonConfigConfirmed: true });
         await queryClient.invalidateQueries({ queryKey: ["settings"] });
       }
@@ -1256,6 +1257,12 @@ function ProviderFormFull({
           category !== "official" && (codexConfig ?? "").trim()
             ? setCodexWireApi(codexConfig ?? "", "responses")
             : (codexConfig ?? "");
+        if (category !== "official" && codexBaseUrl.trim()) {
+          normalizedCodexConfig = setCodexBaseUrl(
+            normalizedCodexConfig,
+            codexBaseUrl,
+          );
+        }
         const normalizedCatalogModels =
           category !== "official" && localCodexApiFormat === "openai_chat"
             ? normalizeCodexCatalogModelsForSave(codexCatalogModels)

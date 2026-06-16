@@ -23,6 +23,10 @@ import type { ProviderLoadLimits, ProviderTestConfig } from "@/types";
 
 export type PricingModelSourceOption = "inherit" | "request" | "response";
 
+const DEFAULT_TEST_TIMEOUT_SECS = "15";
+const DEFAULT_TEST_MAX_RETRIES = "0";
+const DEFAULT_TEST_DEGRADED_THRESHOLD_MS = "3000";
+
 const parseOptionalLoadLimit = (value: string): number | undefined => {
   if (value.trim() === "") {
     return undefined;
@@ -180,7 +184,7 @@ export function ProviderAdvancedConfig({
                         : undefined,
                     })
                   }
-                  placeholder="45"
+                  placeholder={DEFAULT_TEST_TIMEOUT_SECS}
                   disabled={!testConfig.enabled}
                 />
               </div>
@@ -204,7 +208,7 @@ export function ProviderAdvancedConfig({
                         : undefined,
                     })
                   }
-                  placeholder="6000"
+                  placeholder={DEFAULT_TEST_DEGRADED_THRESHOLD_MS}
                   disabled={!testConfig.enabled}
                 />
               </div>
@@ -228,7 +232,7 @@ export function ProviderAdvancedConfig({
                         : undefined,
                     })
                   }
-                  placeholder="1"
+                  placeholder={DEFAULT_TEST_MAX_RETRIES}
                   disabled={!testConfig.enabled}
                 />
               </div>

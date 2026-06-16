@@ -17,8 +17,13 @@ use crate::proxy::providers::transform::anthropic_to_openai;
 use crate::proxy::providers::transform_gemini::anthropic_to_gemini;
 use crate::proxy::providers::transform_responses::anthropic_to_responses;
 use crate::proxy::providers::{
-    get_adapter, AuthInfo, AuthStrategy, ClaudeAdapter, ProviderAdapter,
+    get_adapter, AuthInfo, AuthStrategy, ClaudeAdapter, GeminiAdapter, ProviderAdapter,
 };
+
+const STREAM_CHECK_MAX_OUTPUT_TOKENS: u32 = 1;
+const DEFAULT_STREAM_CHECK_TIMEOUT_SECS: u64 = 15;
+const DEFAULT_STREAM_CHECK_MAX_RETRIES: u32 = 0;
+const DEFAULT_STREAM_CHECK_DEGRADED_THRESHOLD_MS: u64 = 3000;
 
 /// 健康状态枚举
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,14 +59,26 @@ fn default_test_prompt() -> String {
 impl Default for StreamCheckConfig {
     fn default() -> Self {
         Self {
-            timeout_secs: 45,
-            max_retries: 2,
-            degraded_threshold_ms: 6000,
+            timeout_secs: DEFAULT_STREAM_CHECK_TIMEOUT_SECS,
+            max_retries: DEFAULT_STREAM_CHECK_MAX_RETRIES,
+            degraded_threshold_ms: DEFAULT_STREAM_CHECK_DEGRADED_THRESHOLD_MS,
             claude_model: "claude-haiku-4-5-20251001".to_string(),
             codex_model: "gpt-5.5@low".to_string(),
             gemini_model: "gemini-3.5-flash".to_string(),
             test_prompt: default_test_prompt(),
         }
+    }
+}
+
+impl StreamCheckConfig {
+    pub(crate) fn normalize_legacy_probe_defaults(mut self) -> Self {
+        if self.timeout_secs == 45 && self.max_retries == 2 && self.degraded_threshold_ms == 6000 {
+            self.timeout_secs = DEFAULT_STREAM_CHECK_TIMEOUT_SECS;
+            self.max_retries = DEFAULT_STREAM_CHECK_MAX_RETRIES;
+            self.degraded_threshold_ms = DEFAULT_STREAM_CHECK_DEGRADED_THRESHOLD_MS;
+        }
+
+        self
     }
 }
 
@@ -123,7 +140,11 @@ impl StreamCheckService {
                 }
                 Ok(r) => {
                     // 失败但非异常，判断是否重试
-                    if Self::should_retry(&r.message) && attempt < effective_config.max_retries {
+                    let retryable = r
+                        .http_status
+                        .map(Self::should_retry_http_status)
+                        .unwrap_or_else(|| Self::should_retry(&r.message));
+                    if retryable && attempt < effective_config.max_retries {
                         last_result = Some(r.clone());
                         continue;
                     }
@@ -133,8 +154,13 @@ impl StreamCheckService {
                     });
                 }
                 Err(e) => {
-                    if Self::should_retry(&e.to_string()) && attempt < effective_config.max_retries
-                    {
+                    let retryable = match &e {
+                        AppError::HttpStatus { status, .. } => {
+                            Self::should_retry_http_status(*status)
+                        }
+                        _ => Self::should_retry(&e.to_string()),
+                    };
+                    if retryable && attempt < effective_config.max_retries {
                         continue;
                     }
                     return Err(AppError::Message(e.to_string()));
@@ -246,7 +272,12 @@ impl StreamCheckService {
         let client = crate::proxy::http_client::get();
         let request_timeout = std::time::Duration::from_secs(config.timeout_secs);
 
-        let model_to_test = Self::resolve_test_model(app_type, provider, config, model_override.as_deref());
+        let model_to_test = Self::resolve_test_model_with_override(
+            app_type,
+            provider,
+            config,
+            model_override.as_deref(),
+        );
         let test_prompt = &config.test_prompt;
 
         let result = match app_type {
@@ -374,12 +405,10 @@ impl StreamCheckService {
             model,
         );
 
-        let max_tokens = if is_openai_responses { 16 } else { 1 };
-
         // Build from Anthropic-native shape first, then convert for configured targets.
         let anthropic_body = json!({
             "model": model,
-            "max_tokens": max_tokens,
+            "max_tokens": STREAM_CHECK_MAX_OUTPUT_TOKENS,
             "messages": [{ "role": "user", "content": test_prompt }],
             "stream": true
         });
@@ -547,6 +576,30 @@ impl StreamCheckService {
         }
     }
 
+    fn build_codex_stream_body(
+        uses_chat: bool,
+        actual_model: &str,
+        test_prompt: &str,
+    ) -> serde_json::Value {
+        if uses_chat {
+            // Chat Completions 请求体（与 transform_codex_chat::responses_to_chat_completions 对齐）
+            json!({
+                "model": actual_model,
+                "messages": [{ "role": "user", "content": test_prompt }],
+                "max_tokens": STREAM_CHECK_MAX_OUTPUT_TOKENS,
+                "stream": true
+            })
+        } else {
+            // Responses API 请求体格式 (input 必须是数组)
+            json!({
+                "model": actual_model,
+                "input": [{ "role": "user", "content": test_prompt }],
+                "max_output_tokens": STREAM_CHECK_MAX_OUTPUT_TOKENS,
+                "stream": true
+            })
+        }
+    }
+
     /// Codex 流式检查
     ///
     /// 严格按照 Codex CLI 真实请求格式构建请求 (Responses API)
@@ -590,22 +643,7 @@ impl StreamCheckService {
             .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("codex_cli_rs/0.80.0"))
         });
 
-        let mut body = if uses_chat {
-            // Chat Completions 请求体（与 transform_codex_chat::responses_to_chat_completions 对齐）
-            json!({
-                "model": actual_model,
-                "messages": [{ "role": "user", "content": test_prompt }],
-                "max_tokens": 1,
-                "stream": true
-            })
-        } else {
-            // Responses API 请求体格式 (input 必须是数组)
-            json!({
-                "model": actual_model,
-                "input": [{ "role": "user", "content": test_prompt }],
-                "stream": true
-            })
-        };
+        let mut body = Self::build_codex_stream_body(uses_chat, &actual_model, test_prompt);
 
         // Chat 路径只对 OpenAI o-series 透传 reasoning_effort，与 transform_codex_chat
         // 一致；非 o-series（DeepSeek、Kimi 等）收到未知字段会 400。
@@ -687,30 +725,15 @@ impl StreamCheckService {
             format!("{base}/v1beta/models/{normalized_model}:streamGenerateContent?alt=sse")
         };
 
-        // Gemini 原生请求体格式
-        let body = json!({
-            "contents": [{
-                "role": "user",
-                "parts": [{ "text": test_prompt }]
-            }]
-        });
+        let body = Self::build_gemini_stream_body(test_prompt);
 
-        let mut request_builder = match auth.strategy {
-            AuthStrategy::GoogleOAuth => {
-                let token = auth.access_token.as_ref().unwrap_or(&auth.api_key);
-                client
-                    .post(&url)
-                    .header("authorization", format!("Bearer {token}"))
-                    .header("x-goog-api-client", "GeminiCLI/1.0")
-                    .header("Content-Type", "application/json")
-                    .header("Accept", "text/event-stream")
-            }
-            _ => client
-                .post(&url)
-                .header("x-goog-api-key", &auth.api_key)
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream"),
-        };
+        let mut request_builder = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .header("accept-encoding", "identity");
+
+        request_builder = Self::apply_gemini_auth_headers(request_builder, auth)?;
 
         // 供应商自定义 headers 最后追加
         if let Some(headers) = extra_headers {
@@ -746,6 +769,33 @@ impl StreamCheckService {
         }
     }
 
+    fn build_gemini_stream_body(test_prompt: &str) -> serde_json::Value {
+        json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{ "text": test_prompt }]
+            }],
+            "generationConfig": {
+                "maxOutputTokens": STREAM_CHECK_MAX_OUTPUT_TOKENS
+            }
+        })
+    }
+
+    fn apply_gemini_auth_headers(
+        mut request_builder: reqwest::RequestBuilder,
+        auth: &AuthInfo,
+    ) -> Result<reqwest::RequestBuilder, AppError> {
+        let auth_headers = GeminiAdapter::new()
+            .get_auth_headers(auth)
+            .map_err(|e| AppError::Message(format!("stream check 构造 Gemini 鉴权头失败: {e}")))?;
+
+        for (name, value) in auth_headers {
+            request_builder = request_builder.header(name, value);
+        }
+
+        Ok(request_builder)
+    }
+
     /// OpenCode / OpenClaw 的独立分发入口（绕过 `get_adapter`）
     ///
     /// 这两个应用的 `settings_config` 与 Claude/Codex/Gemini 完全不同：
@@ -765,7 +815,12 @@ impl StreamCheckService {
         let client = crate::proxy::http_client::get();
         let request_timeout = std::time::Duration::from_secs(config.timeout_secs);
 
-        let model_to_test = Self::resolve_test_model(app_type, provider, config, model_override);
+        let model_to_test = Self::resolve_test_model_with_override(
+            app_type,
+            provider,
+            config,
+            model_override,
+        );
         let test_prompt = &config.test_prompt;
 
         let result = match app_type {
@@ -1391,7 +1446,19 @@ impl StreamCheckService {
 
     fn should_retry(msg: &str) -> bool {
         let lower = msg.to_lowercase();
-        lower.contains("timeout") || lower.contains("abort") || lower.contains("timed out")
+        lower.contains("timeout")
+            || lower.contains("abort")
+            || lower.contains("timed out")
+            || lower.contains("rate limited (429)")
+            || lower.contains("internal server error (500)")
+            || lower.contains("bad gateway (502)")
+            || lower.contains("service unavailable (503)")
+            || lower.contains("gateway timeout (504)")
+            || lower.contains("server error")
+    }
+
+    fn should_retry_http_status(status: u16) -> bool {
+        status == 429 || (500..600).contains(&status)
     }
 
     fn map_request_error(e: reqwest::Error) -> AppError {
@@ -1437,41 +1504,33 @@ impl StreamCheckService {
         }
     }
 
-    fn resolve_test_model(
+    fn resolve_test_model_with_override(
         app_type: &AppType,
         provider: &Provider,
         config: &StreamCheckConfig,
         model_override: Option<&str>,
     ) -> String {
-        if let Some(override_model) = model_override
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            return override_model.to_string();
+        if let Some(model) = model_override.and_then(Self::non_empty_model) {
+            return model;
         }
 
-        if let Some(test_model) = provider
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.test_config.as_ref())
-            .filter(|test_config| test_config.enabled)
-            .and_then(|test_config| test_config.test_model.as_deref())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            return test_model.to_string();
+        if let Some(model) = Self::extract_provider_test_model(provider) {
+            return model;
+        }
+
+        if let Some(model) = Self::extract_config_test_model(app_type, config) {
+            return model;
         }
 
         match app_type {
             AppType::Claude | AppType::ClaudeDesktop => {
                 Self::extract_env_model(provider, "ANTHROPIC_MODEL")
-                    .unwrap_or_else(|| config.claude_model.clone())
+                    .unwrap_or_else(|| StreamCheckConfig::default().claude_model)
             }
-            AppType::Codex => {
-                Self::extract_codex_model(provider).unwrap_or_else(|| config.codex_model.clone())
-            }
+            AppType::Codex => Self::extract_codex_model(provider)
+                .unwrap_or_else(|| StreamCheckConfig::default().codex_model),
             AppType::Gemini => Self::extract_env_model(provider, "GEMINI_MODEL")
-                .unwrap_or_else(|| config.gemini_model.clone()),
+                .unwrap_or_else(|| StreamCheckConfig::default().gemini_model),
             AppType::OpenCode => {
                 // OpenCode uses models map in settings_config
                 // Try to extract first model from the models object
@@ -1482,6 +1541,36 @@ impl StreamCheckService {
                 // Try to extract first model from the models array
                 Self::extract_openclaw_model(provider).unwrap_or_else(|| "gpt-4o".to_string())
             }
+        }
+    }
+
+    fn extract_provider_test_model(provider: &Provider) -> Option<String> {
+        provider
+            .meta
+            .as_ref()
+            .and_then(|m| m.test_config.as_ref())
+            .filter(|tc| tc.enabled)
+            .and_then(|tc| tc.test_model.as_deref())
+            .and_then(Self::non_empty_model)
+    }
+
+    fn extract_config_test_model(app_type: &AppType, config: &StreamCheckConfig) -> Option<String> {
+        let model = match app_type {
+            AppType::Claude | AppType::ClaudeDesktop => &config.claude_model,
+            AppType::Codex => &config.codex_model,
+            AppType::Gemini => &config.gemini_model,
+            AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => return None,
+        };
+
+        Self::non_empty_model(model)
+    }
+
+    fn non_empty_model(value: &str) -> Option<String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
         }
     }
 
@@ -1656,19 +1745,26 @@ impl StreamCheckService {
         }
     }
 
-    pub(crate) fn resolve_effective_test_model(
+    pub(crate) fn resolve_effective_test_model_with_override(
         app_type: &AppType,
         provider: &Provider,
         config: &StreamCheckConfig,
+        model_override: Option<&str>,
     ) -> String {
         let effective_config = Self::merge_provider_config(provider, config);
-        Self::resolve_test_model(app_type, provider, &effective_config, None)
+        Self::resolve_test_model_with_override(
+            app_type,
+            provider,
+            &effective_config,
+            model_override,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{ProviderMeta, ProviderTestConfig};
 
     fn make_provider(settings_config: serde_json::Value) -> Provider {
         Provider::with_id(
@@ -1839,6 +1935,39 @@ mod tests {
     }
 
     #[test]
+    fn test_build_codex_stream_body_limits_responses_output() {
+        let body = StreamCheckService::build_codex_stream_body(false, "gpt-5.5", "ping");
+
+        assert_eq!(body["model"], "gpt-5.5");
+        assert_eq!(
+            body["max_output_tokens"],
+            json!(STREAM_CHECK_MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(body["stream"], true);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn test_build_codex_stream_body_limits_chat_output() {
+        let body = StreamCheckService::build_codex_stream_body(true, "deepseek-chat", "ping");
+
+        assert_eq!(body["model"], "deepseek-chat");
+        assert_eq!(body["max_tokens"], json!(STREAM_CHECK_MAX_OUTPUT_TOKENS));
+        assert_eq!(body["stream"], true);
+        assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn test_build_gemini_stream_body_limits_output() {
+        let body = StreamCheckService::build_gemini_stream_body("ping");
+
+        assert_eq!(
+            body["generationConfig"]["maxOutputTokens"],
+            json!(STREAM_CHECK_MAX_OUTPUT_TOKENS)
+        );
+    }
+
+    #[test]
     fn test_determine_status() {
         assert_eq!(
             StreamCheckService::determine_status(3000, 6000),
@@ -1860,14 +1989,166 @@ mod tests {
         assert!(StreamCheckService::should_retry("request timed out"));
         assert!(StreamCheckService::should_retry("connection abort"));
         assert!(!StreamCheckService::should_retry("API Key invalid"));
+
+        assert!(StreamCheckService::should_retry_http_status(429));
+        assert!(StreamCheckService::should_retry_http_status(500));
+        assert!(StreamCheckService::should_retry_http_status(502));
+        assert!(StreamCheckService::should_retry_http_status(503));
+        assert!(StreamCheckService::should_retry_http_status(504));
+        assert!(!StreamCheckService::should_retry_http_status(400));
+        assert!(!StreamCheckService::should_retry_http_status(401));
+        assert!(!StreamCheckService::should_retry_http_status(403));
+        assert!(!StreamCheckService::should_retry_http_status(404));
+    }
+
+    #[test]
+    fn test_resolve_test_model_uses_global_codex_test_model_before_runtime_model() {
+        let provider = make_provider(serde_json::json!({
+            "config": r#"model = "runtime-model"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+base_url = "https://example.com/v1""#
+        }));
+        let config = StreamCheckConfig {
+            codex_model: "global-test-model@low".to_string(),
+            ..StreamCheckConfig::default()
+        };
+
+        assert_eq!(
+            StreamCheckService::resolve_effective_test_model_with_override(
+                &AppType::Codex,
+                &provider,
+                &config,
+                None,
+            ),
+            "global-test-model@low"
+        );
+    }
+
+    #[test]
+    fn test_resolve_test_model_uses_provider_test_model_before_global_config() {
+        let mut provider = make_provider(serde_json::json!({
+            "config": r#"model = "runtime-model""#
+        }));
+        provider.meta = Some(ProviderMeta {
+            test_config: Some(ProviderTestConfig {
+                enabled: true,
+                test_model: Some("provider-test-model".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = StreamCheckConfig {
+            codex_model: "global-test-model".to_string(),
+            ..StreamCheckConfig::default()
+        };
+
+        assert_eq!(
+            StreamCheckService::resolve_effective_test_model_with_override(
+                &AppType::Codex,
+                &provider,
+                &config,
+                None,
+            ),
+            "provider-test-model"
+        );
+    }
+
+    #[test]
+    fn test_resolve_test_model_uses_one_shot_override_first() {
+        let mut provider = make_provider(serde_json::json!({
+            "config": r#"model = "runtime-model""#
+        }));
+        provider.meta = Some(ProviderMeta {
+            test_config: Some(ProviderTestConfig {
+                enabled: true,
+                test_model: Some("provider-test-model".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = StreamCheckConfig {
+            codex_model: "global-test-model".to_string(),
+            ..StreamCheckConfig::default()
+        };
+
+        assert_eq!(
+            StreamCheckService::resolve_effective_test_model_with_override(
+                &AppType::Codex,
+                &provider,
+                &config,
+                Some(" one-shot-model "),
+            ),
+            "one-shot-model"
+        );
+    }
+
+    #[test]
+    fn test_resolve_test_model_falls_back_to_runtime_model_when_test_models_are_empty() {
+        let provider = make_provider(serde_json::json!({
+            "config": r#"model = "runtime-model""#
+        }));
+        let config = StreamCheckConfig {
+            codex_model: "  ".to_string(),
+            ..StreamCheckConfig::default()
+        };
+
+        assert_eq!(
+            StreamCheckService::resolve_effective_test_model_with_override(
+                &AppType::Codex,
+                &provider,
+                &config,
+                None,
+            ),
+            "runtime-model"
+        );
     }
 
     #[test]
     fn test_default_config() {
         let config = StreamCheckConfig::default();
-        assert_eq!(config.timeout_secs, 45);
-        assert_eq!(config.max_retries, 2);
-        assert_eq!(config.degraded_threshold_ms, 6000);
+        assert_eq!(config.timeout_secs, DEFAULT_STREAM_CHECK_TIMEOUT_SECS);
+        assert_eq!(config.max_retries, DEFAULT_STREAM_CHECK_MAX_RETRIES);
+        assert_eq!(
+            config.degraded_threshold_ms,
+            DEFAULT_STREAM_CHECK_DEGRADED_THRESHOLD_MS
+        );
+    }
+
+    #[test]
+    fn test_normalize_legacy_probe_defaults_migrates_old_slow_defaults() {
+        let config = StreamCheckConfig {
+            timeout_secs: 45,
+            max_retries: 2,
+            degraded_threshold_ms: 6000,
+            ..StreamCheckConfig::default()
+        }
+        .normalize_legacy_probe_defaults();
+
+        assert_eq!(config.timeout_secs, DEFAULT_STREAM_CHECK_TIMEOUT_SECS);
+        assert_eq!(config.max_retries, DEFAULT_STREAM_CHECK_MAX_RETRIES);
+        assert_eq!(
+            config.degraded_threshold_ms,
+            DEFAULT_STREAM_CHECK_DEGRADED_THRESHOLD_MS
+        );
+    }
+
+    #[test]
+    fn test_normalize_legacy_probe_defaults_preserves_custom_values() {
+        let config = StreamCheckConfig {
+            timeout_secs: 30,
+            max_retries: 1,
+            degraded_threshold_ms: 5000,
+            ..StreamCheckConfig::default()
+        }
+        .normalize_legacy_probe_defaults();
+
+        assert_eq!(config.timeout_secs, 30);
+        assert_eq!(config.max_retries, 1);
+        assert_eq!(config.degraded_threshold_ms, 5000);
     }
 
     #[test]
@@ -2088,6 +2369,60 @@ mod tests {
             url,
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
         );
+    }
+
+    #[test]
+    fn test_apply_gemini_auth_headers_uses_api_key_header() {
+        let client = Client::new();
+        let auth = AuthInfo::new("AIza-test-key".to_string(), AuthStrategy::Google);
+        let request = StreamCheckService::apply_gemini_auth_headers(
+            client.post("https://generativelanguage.googleapis.com"),
+            &auth,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("x-goog-api-key")
+                .and_then(|v| v.to_str().ok()),
+            Some("AIza-test-key")
+        );
+        assert!(request.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn test_apply_gemini_auth_headers_uses_oauth_bearer_header() {
+        let client = Client::new();
+        let auth = AuthInfo::with_access_token(
+            "stored-oauth-creds".to_string(),
+            "ya29.access-token".to_string(),
+        );
+        let request = StreamCheckService::apply_gemini_auth_headers(
+            client.post("https://generativelanguage.googleapis.com"),
+            &auth,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer ya29.access-token")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-goog-api-client")
+                .and_then(|v| v.to_str().ok()),
+            Some("GeminiCLI/1.0")
+        );
+        assert!(request.headers().get("x-goog-api-key").is_none());
     }
 
     #[test]

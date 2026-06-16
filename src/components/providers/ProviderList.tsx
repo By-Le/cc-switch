@@ -7,22 +7,27 @@ import {
 } from "@dnd-kit/sortable";
 import {
   useEffect,
+  useCallback,
   useMemo,
   useRef,
   useState,
   type CSSProperties,
 } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, Search, X } from "lucide-react";
+import { AlertTriangle, Check, Search, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import type { Provider } from "@/types";
+import { extractCodexModelName } from "@/utils/providerConfigUtils";
 import type { ActiveTarget } from "@/types/proxy";
 import type { AppId } from "@/lib/api";
-import type { ProviderStreamCheckResult } from "@/lib/api/model-test";
+import {
+  getStreamCheckConfig,
+  type ProviderStreamCheckResult,
+  type StreamCheckConfig,
+} from "@/lib/api/model-test";
 import { providersApi } from "@/lib/api/providers";
-import { extractCodexModelName } from "@/utils/providerConfigUtils";
 import { useDragSort } from "@/hooks/useDragSort";
 import {
   useOpenClawLiveProviderIds,
@@ -45,11 +50,13 @@ import {
   useCurrentOmoProviderId,
   useCurrentOmoSlimProviderId,
 } from "@/lib/query/omo";
-import { useCallback } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { settingsApi } from "@/lib/api/settings";
+import { cn } from "@/lib/utils";
 import {
   Dialog,
   DialogContent,
@@ -58,6 +65,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+
+type TestModelOption = {
+  value: string;
+  label?: string;
+};
 
 interface ProviderListProps {
   providers: Record<string, Provider>;
@@ -86,69 +98,8 @@ interface ModelTestDialogState {
   provider: Provider;
   suggestedModel: string;
   modelInput: string;
+  options: TestModelOption[];
 }
-
-const getProviderTestConfigModel = (provider: Provider): string | undefined => {
-  const testModel = provider.meta?.testConfig?.enabled
-    ? provider.meta.testConfig.testModel?.trim()
-    : undefined;
-  return testModel || undefined;
-};
-
-const getProviderConfigModel = (
-  provider: Provider,
-  appId: AppId,
-): string | undefined => {
-  if (appId === "claude" || appId === "claude-desktop") {
-    const model = provider.settingsConfig?.env?.ANTHROPIC_MODEL;
-    return typeof model === "string" && model.trim() ? model.trim() : undefined;
-  }
-
-  if (appId === "codex") {
-    const configText = provider.settingsConfig?.config;
-    return typeof configText === "string"
-      ? extractCodexModelName(configText)
-      : undefined;
-  }
-
-  if (appId === "gemini") {
-    const model = provider.settingsConfig?.env?.GEMINI_MODEL;
-    return typeof model === "string" && model.trim() ? model.trim() : undefined;
-  }
-
-  if (appId === "opencode") {
-    const models = provider.settingsConfig?.models;
-    if (!models || typeof models !== "object" || Array.isArray(models)) {
-      return undefined;
-    }
-    const [firstModel] = Object.keys(models);
-    return firstModel?.trim() || undefined;
-  }
-
-  if (appId === "openclaw" || appId === "hermes") {
-    const models = provider.settingsConfig?.models;
-    if (!Array.isArray(models)) {
-      return undefined;
-    }
-
-    const firstId = models
-      .map((model) =>
-        typeof model?.id === "string" ? model.id.trim() : undefined,
-      )
-      .find(Boolean);
-    return firstId || undefined;
-  }
-
-  return undefined;
-};
-
-const getSuggestedTestModel = (provider: Provider, appId: AppId): string => {
-  return (
-    getProviderTestConfigModel(provider) ??
-    getProviderConfigModel(provider, appId) ??
-    ""
-  );
-};
 
 export function ProviderList({
   providers,
@@ -173,6 +124,7 @@ export function ProviderList({
   onSetAsDefault,
 }: ProviderListProps) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const { checkProvider, isChecking, lastResults = {} } = useStreamCheck(appId);
   const { sortedProviders, sensors, handleDragEnd } = useDragSort(
     providers,
@@ -282,6 +234,9 @@ export function ProviderList({
   const [searchTerm, setSearchTerm] = useState("");
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const [showStreamCheckConfirm, setShowStreamCheckConfirm] = useState(false);
+  const [pendingTestProvider, setPendingTestProvider] =
+    useState<Provider | null>(null);
   const [activeSessionsDialog, setActiveSessionsDialog] = useState<{
     providerName: string;
     sessionIds: string[];
@@ -295,17 +250,174 @@ export function ProviderList({
     refetchInterval: appId === "claude-desktop" ? 5000 : false,
   });
 
-  const handleTest = useCallback(
+  // Query settings for streamCheckConfirmed flag
+  const { data: settings } = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => settingsApi.get(),
+  });
+
+  const { data: streamCheckConfig } = useQuery({
+    queryKey: ["streamCheckConfig"],
+    queryFn: () => getStreamCheckConfig(),
+  });
+
+  const getGlobalTestModel = useCallback(
+    (config: StreamCheckConfig | undefined): string | undefined => {
+      if (!config) return undefined;
+      const value =
+        appId === "claude" || appId === "claude-desktop"
+          ? config.claudeModel
+          : appId === "codex"
+            ? config.codexModel
+            : appId === "gemini"
+              ? config.geminiModel
+              : undefined;
+      return value?.trim() || undefined;
+    },
+    [appId],
+  );
+
+  const getProviderRuntimeModel = useCallback(
+    (provider: Provider): string | undefined => {
+      const config = provider.settingsConfig ?? {};
+      if (appId === "claude" || appId === "claude-desktop") {
+        const env = config.env as Record<string, unknown> | undefined;
+        const value = env?.ANTHROPIC_MODEL;
+        return typeof value === "string" ? value.trim() || undefined : undefined;
+      }
+      if (appId === "gemini") {
+        const env = config.env as Record<string, unknown> | undefined;
+        const value = env?.GEMINI_MODEL;
+        return typeof value === "string" ? value.trim() || undefined : undefined;
+      }
+      if (appId === "codex") {
+        return extractCodexModelName(config.config);
+      }
+      if (appId === "opencode") {
+        const models = config.models as Record<string, unknown> | undefined;
+        return models ? Object.keys(models)[0] : undefined;
+      }
+      if (appId === "openclaw") {
+        const models = Array.isArray(config.models) ? config.models : [];
+        const first = models[0] as { id?: unknown } | undefined;
+        return typeof first?.id === "string" ? first.id.trim() || undefined : undefined;
+      }
+      if (appId === "hermes") {
+        const model = config.model as { default?: unknown } | undefined;
+        if (typeof model?.default === "string") {
+          const trimmed = model.default.trim();
+          if (trimmed) return trimmed;
+        }
+        const models = Array.isArray(config.models) ? config.models : [];
+        const first = models[0] as { id?: unknown } | undefined;
+        return typeof first?.id === "string" ? first.id.trim() || undefined : undefined;
+      }
+      return undefined;
+    },
+    [appId],
+  );
+
+  const getProviderTestModelOptions = useCallback(
+    (provider: Provider): TestModelOption[] => {
+      const config = provider.settingsConfig ?? {};
+      const options: TestModelOption[] = [];
+      const seen = new Set<string>();
+      const pushOption = (value?: string, label?: string) => {
+        const normalized = value?.trim();
+        if (!normalized || seen.has(normalized)) return;
+        seen.add(normalized);
+        options.push({ value: normalized, label: label?.trim() || undefined });
+      };
+
+      pushOption(provider.meta?.testConfig?.testModel);
+      pushOption(getGlobalTestModel(streamCheckConfig));
+      pushOption(getProviderRuntimeModel(provider));
+
+      if (appId === "codex") {
+        const catalogModels = Array.isArray(config.modelCatalog?.models)
+          ? (config.modelCatalog.models as Array<Record<string, unknown>>)
+          : [];
+        for (const item of catalogModels) {
+          pushOption(
+            typeof item.model === "string" ? item.model : undefined,
+            typeof item.displayName === "string" ? item.displayName : undefined,
+          );
+        }
+      } else if (appId === "opencode") {
+        const models = config.models as Record<string, { name?: string }> | undefined;
+        if (models) {
+          for (const [id, model] of Object.entries(models)) {
+            pushOption(id, model?.name);
+          }
+        }
+      } else if (appId === "openclaw" || appId === "hermes") {
+        const models = Array.isArray(config.models) ? config.models : [];
+        for (const item of models as Array<{ id?: unknown; name?: unknown; alias?: unknown }>) {
+          pushOption(
+            typeof item.id === "string" ? item.id : undefined,
+            typeof item.name === "string"
+              ? item.name
+              : typeof item.alias === "string"
+                ? item.alias
+                : undefined,
+          );
+        }
+      } else if (appId === "claude" || appId === "claude-desktop") {
+        pushOption(config.env?.ANTHROPIC_MODEL as string | undefined);
+      } else if (appId === "gemini") {
+        pushOption(config.env?.GEMINI_MODEL as string | undefined);
+      }
+
+      return options;
+    },
+    [appId, getGlobalTestModel, getProviderRuntimeModel, streamCheckConfig],
+  );
+
+  const openModelDialog = useCallback(
     (provider: Provider) => {
-      const suggestedModel = getSuggestedTestModel(provider, appId);
+      const options = getProviderTestModelOptions(provider);
+      const suggestedModel = options[0]?.value ?? "";
       setModelTestDialog({
         provider,
         suggestedModel,
         modelInput: suggestedModel,
+        options,
       });
     },
-    [appId],
+    [getProviderTestModelOptions],
   );
+
+  const handleTest = useCallback(
+    (provider: Provider) => {
+      if (!settings?.streamCheckConfirmed) {
+        setPendingTestProvider(provider);
+        setShowStreamCheckConfirm(true);
+        return;
+      }
+
+      openModelDialog(provider);
+    },
+    [openModelDialog, settings?.streamCheckConfirmed],
+  );
+
+  const handleStreamCheckConfirm = useCallback(async () => {
+    setShowStreamCheckConfirm(false);
+
+    try {
+      if (settings) {
+        const { webdavSync: _, s3Sync: _s3Sync, ...rest } = settings;
+        await settingsApi.save({ ...rest, streamCheckConfirmed: true });
+        await queryClient.invalidateQueries({ queryKey: ["settings"] });
+      }
+    } catch (error) {
+      console.error("Failed to save stream check confirmed:", error);
+    }
+
+    if (pendingTestProvider) {
+      openModelDialog(pendingTestProvider);
+      setPendingTestProvider(null);
+    }
+  }, [openModelDialog, pendingTestProvider, queryClient, settings]);
 
   const handleRunModelTest = useCallback(async () => {
     if (!modelTestDialog) {
@@ -319,14 +431,17 @@ export function ProviderList({
       modelOverride,
     );
 
-    // 只有测试完成（无论成功/失败）都关闭弹窗；仅网络级异常（null）时保持弹窗以便重试
     if (result) {
       setModelTestDialog(null);
     }
   }, [checkProvider, modelTestDialog]);
 
+  const currentTestModelOptions = useMemo(
+    () => modelTestDialog?.options ?? [],
+    [modelTestDialog?.options],
+  );
+
   // Import current live config as default provider
-  const queryClient = useQueryClient();
   const importMutation = useMutation({
     mutationFn: async (): Promise<boolean> => {
       if (appId === "opencode") {
@@ -701,6 +816,19 @@ export function ProviderList({
         renderProviderList()
       )}
 
+      <ConfirmDialog
+        isOpen={showStreamCheckConfirm}
+        variant="info"
+        title={t("confirm.streamCheck.title")}
+        message={t("confirm.streamCheck.message")}
+        confirmText={t("confirm.streamCheck.confirm")}
+        onConfirm={() => void handleStreamCheckConfirm()}
+        onCancel={() => {
+          setShowStreamCheckConfirm(false);
+          setPendingTestProvider(null);
+        }}
+      />
+
       <Dialog
         open={activeSessionsDialog !== null}
         onOpenChange={(open) => {
@@ -756,24 +884,24 @@ export function ProviderList({
           }
         }}
       >
-        <DialogContent className="max-w-md" zIndex="top">
-          <DialogHeader>
+        <DialogContent className="max-w-[34rem]" zIndex="top">
+          <DialogHeader className="items-start text-left">
             <DialogTitle>
-              {t("modelTest.dialogTitle", {
+              {t("streamCheck.selectModelTitle", {
                 providerName: modelTestDialog?.provider.name ?? "",
                 defaultValue: "选择测试模型",
               })}
             </DialogTitle>
-            <DialogDescription className="space-y-2">
+            <DialogDescription className="max-w-none space-y-2 text-left leading-relaxed">
               <span className="block">
-                {t("modelTest.dialogDescription", {
+                {t("streamCheck.selectModelDescription", {
                   defaultValue:
-                    "将发送一条真实流式模型请求。你可以临时指定本次要测试的模型，不会改写供应商配置。",
+                    "将发送一条真实流式模型请求。你可以临时指定本次要测试的模型，也可以保留下面的手动输入。",
                 })}
               </span>
               {modelTestDialog?.suggestedModel ? (
                 <span className="block">
-                  {t("modelTest.suggestedModel", {
+                  {t("streamCheck.currentSuggestedModelWithValue", {
                     model: modelTestDialog.suggestedModel,
                     defaultValue: "当前建议模型：{{model}}",
                   })}
@@ -789,29 +917,85 @@ export function ProviderList({
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-2 px-6 py-4">
-            <Label htmlFor="provider-model-test-input">
-              {t("modelTest.dialogInputLabel", {
-                defaultValue: "测试模型",
-              })}
-            </Label>
-            <Input
-              id="provider-model-test-input"
-              value={modelTestDialog?.modelInput ?? ""}
-              onChange={(event) =>
-                setModelTestDialog((current) =>
-                  current
-                    ? { ...current, modelInput: event.target.value }
-                    : current,
-                )
-              }
-              placeholder={t("modelTest.dialogInputPlaceholder", {
-                defaultValue: "留空使用当前配置/全局默认",
-              })}
-              disabled={
-                modelTestDialog ? isChecking(modelTestDialog.provider.id) : false
-              }
-            />
+          <div className="space-y-4 px-6 py-4">
+            <div className="space-y-2">
+              <div className="text-sm font-medium text-foreground">
+                {t("streamCheck.modelListLabel", {
+                  defaultValue: "模型列表",
+                })}
+              </div>
+              {currentTestModelOptions.length > 0 ? (
+                <div className="grid max-h-40 grid-cols-1 gap-2 overflow-y-auto pr-1 sm:grid-cols-2">
+                  {currentTestModelOptions.map((option) => {
+                    const active =
+                      modelTestDialog?.modelInput.trim() === option.value;
+                    return (
+                      <Button
+                        key={option.value}
+                        type="button"
+                        variant={active ? "default" : "outline"}
+                        className={cn(
+                          "h-auto justify-start px-3 py-2 text-left",
+                          active && "shadow-sm",
+                        )}
+                        onClick={() =>
+                          setModelTestDialog((current) =>
+                            current
+                              ? { ...current, modelInput: option.value }
+                              : current,
+                          )
+                        }
+                        disabled={
+                          modelTestDialog
+                            ? isChecking(modelTestDialog.provider.id)
+                            : false
+                        }
+                      >
+                        <span className="min-w-0 flex-1 break-all">
+                          {option.label ?? option.value}
+                        </span>
+                        {active ? (
+                          <Check className="h-4 w-4 shrink-0" />
+                        ) : null}
+                      </Button>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  {t("streamCheck.noModelAvailable", {
+                    defaultValue: "暂无",
+                  })}
+                </p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="provider-model-test-input">
+                {t("streamCheck.testModelLabel", {
+                  defaultValue: "测试模型",
+                })}
+              </Label>
+              <Input
+                id="provider-model-test-input"
+                value={modelTestDialog?.modelInput ?? ""}
+                onChange={(event) =>
+                  setModelTestDialog((current) =>
+                    current
+                      ? { ...current, modelInput: event.target.value }
+                      : current,
+                  )
+                }
+                placeholder={t("streamCheck.testModelPlaceholder", {
+                  defaultValue: "输入模型名，或从上方选择",
+                })}
+                disabled={
+                  modelTestDialog
+                    ? isChecking(modelTestDialog.provider.id)
+                    : false
+                }
+              />
+            </div>
           </div>
 
           <DialogFooter>
@@ -834,7 +1018,7 @@ export function ProviderList({
             >
               {modelTestDialog && isChecking(modelTestDialog.provider.id)
                 ? t("modelTest.testing", { defaultValue: "正在测试模型" })
-                : t("modelTest.confirmTest", {
+                : t("streamCheck.startTest", {
                     defaultValue: "开始测试",
                   })}
             </Button>

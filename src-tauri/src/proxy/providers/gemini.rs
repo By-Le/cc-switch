@@ -200,7 +200,17 @@ impl ProviderAdapter for GeminiAdapter {
             AuthStrategy::GoogleOAuth => {
                 // 解析 OAuth 凭证
                 if let Some(creds) = self.parse_oauth_credentials(&key) {
-                    Some(AuthInfo::with_access_token(key, creds.access_token))
+                    if creds.access_token.is_empty() {
+                        log::warn!(
+                            "[Gemini OAuth] access_token missing or empty for provider `{}`; \
+                             bearer auth will likely fail with 401. Refresh \
+                             ~/.gemini/oauth_creds.json via the gemini CLI to obtain a new token.",
+                            provider.id
+                        );
+                        Some(AuthInfo::new(key, AuthStrategy::GoogleOAuth))
+                    } else {
+                        Some(AuthInfo::with_access_token(key, creds.access_token))
+                    }
                 } else {
                     // 回退到普通 API Key
                     Some(AuthInfo::new(key, AuthStrategy::Google))
@@ -335,6 +345,44 @@ mod tests {
         let auth = adapter.extract_auth(&provider).unwrap();
         assert_eq!(auth.strategy, AuthStrategy::GoogleOAuth);
         assert_eq!(auth.access_token, Some("ya29.test-token".to_string()));
+    }
+
+    #[test]
+    fn test_extract_auth_oauth_refresh_only_json_does_not_expose_empty_bearer() {
+        let adapter = GeminiAdapter::new();
+        let provider = create_provider(json!({
+            "env": {
+                "GEMINI_API_KEY": "{\"refresh_token\":\"1//refresh\",\"client_id\":\"cid\",\"client_secret\":\"cs\"}"
+            }
+        }));
+
+        let auth = adapter.extract_auth(&provider).unwrap();
+        assert_eq!(auth.strategy, AuthStrategy::GoogleOAuth);
+        assert!(
+            auth.access_token
+                .as_deref()
+                .is_none_or(|token| !token.is_empty()),
+            "empty access_token leaked into AuthInfo"
+        );
+    }
+
+    #[test]
+    fn test_extract_auth_oauth_empty_access_token_json_degrades_to_raw_key() {
+        let adapter = GeminiAdapter::new();
+        let provider = create_provider(json!({
+            "env": {
+                "GEMINI_API_KEY": "{\"access_token\":\"\",\"refresh_token\":\"1//refresh\"}"
+            }
+        }));
+
+        let auth = adapter.extract_auth(&provider).unwrap();
+        assert_eq!(auth.strategy, AuthStrategy::GoogleOAuth);
+        assert!(
+            auth.access_token
+                .as_deref()
+                .is_none_or(|token| !token.is_empty()),
+            "empty access_token leaked into AuthInfo"
+        );
     }
 
     #[test]
