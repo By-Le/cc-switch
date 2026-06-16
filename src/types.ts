@@ -117,6 +117,10 @@ export interface ProviderTestConfig {
   degradedThresholdMs?: number;
   // 最大重试次数
   maxRetries?: number;
+  // 默认测试模型
+  testModel?: string;
+  // 默认测试提示词
+  testPrompt?: string;
 }
 
 export interface ProviderLoadLimits {

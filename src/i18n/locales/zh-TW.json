@@ -2300,7 +2300,14 @@
   "modelTest": {
     "testProvider": "測試模型",
     "testing": "正在測試模型",
-    "unavailable": "目前供應商不支援模型測試"
+    "unavailable": "目前供應商不支援模型測試",
+    "dialogTitle": "選擇測試模型",
+    "dialogDescription": "將送出一條真實的流式模型請求。你可以暫時指定本次要測試的模型，不會改寫供應商設定。",
+    "suggestedModel": "目前建議模型：{{model}}",
+    "emptyModelHint": "留空時會依目前供應商設定或全域預設測試模型執行。",
+    "dialogInputLabel": "測試模型",
+    "dialogInputPlaceholder": "留空使用目前設定/全域預設",
+    "confirmTest": "開始測試"
   },
   "health": {
     "operational": "正常",

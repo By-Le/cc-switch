@@ -2328,7 +2328,14 @@
   "modelTest": {
     "testProvider": "Test model",
     "testing": "Testing model",
-    "unavailable": "Model test is not supported for this provider"
+    "unavailable": "Model test is not supported for this provider",
+    "dialogTitle": "Choose test model",
+    "dialogDescription": "A real streaming model request will be sent. You can temporarily override the model for this run without changing provider settings.",
+    "suggestedModel": "Suggested model: {{model}}",
+    "emptyModelHint": "Leave empty to use the current provider config or the global default test model.",
+    "dialogInputLabel": "Test model",
+    "dialogInputPlaceholder": "Leave empty to use current/global default",
+    "confirmTest": "Run test"
   },
   "health": {
     "operational": "Operational",

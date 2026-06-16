@@ -1,7 +1,6 @@
-//! 供应商连通性检查命令
+//! 流式模型测试命令
 //!
-//! 注意：本检查只探测 base_url 是否可达，不发真实大模型请求，也不触碰故障转移
-//! 熔断器（熔断器由真实转发流量驱动）。详见 `services::stream_check`。
+//! 通过发送真实模型请求验证 provider 是否可用，但不会修改故障转移熔断器状态。
 
 use crate::app_config::AppType;
 use crate::commands::copilot::CopilotAuthState;
@@ -20,6 +19,7 @@ pub async fn stream_check_provider(
     copilot_state: State<'_, CopilotAuthState>,
     app_type: AppType,
     provider_id: String,
+    model_override: Option<String>,
 ) -> Result<StreamCheckResult, AppError> {
     let config = state.db.get_stream_check_config()?;
 
@@ -28,12 +28,27 @@ pub async fn stream_check_provider(
         .get(&provider_id)
         .ok_or_else(|| AppError::Message(format!("供应商 {provider_id} 不存在")))?;
 
-    // Copilot 端点是动态的（随 OAuth token 解析），需预先取出 host 再探测；
-    // 其余供应商传 None，由服务层从 settings_config 提取 base_url。无需鉴权。
+    let auth_override = resolve_copilot_auth_override(provider, &copilot_state).await?;
     let base_url_override = resolve_copilot_base_url_override(provider, &copilot_state).await?;
-    let result =
-        StreamCheckService::check_with_retry(&app_type, provider, &config, base_url_override)
-            .await?;
+    let claude_api_format_override = resolve_claude_api_format_override(
+        &app_type,
+        provider,
+        &config,
+        &copilot_state,
+        auth_override.as_ref(),
+        model_override.as_deref(),
+    )
+    .await?;
+    let result = StreamCheckService::check_with_retry(
+        &app_type,
+        provider,
+        &config,
+        auth_override,
+        base_url_override,
+        claude_api_format_override,
+        model_override,
+    )
+    .await?;
 
     // 记录日志
     let _ =
@@ -78,22 +93,56 @@ pub async fn stream_check_all_providers(
             }
         }
 
+        let auth_override = resolve_copilot_auth_override(&provider, &copilot_state).await?;
         let base_url_override =
             resolve_copilot_base_url_override(&provider, &copilot_state).await?;
-        let result =
-            StreamCheckService::check_with_retry(&app_type, &provider, &config, base_url_override)
-                .await
-                .unwrap_or_else(|e| StreamCheckResult {
-                    status: HealthStatus::Failed,
-                    success: false,
-                    message: e.to_string(),
-                    response_time_ms: None,
-                    http_status: None,
-                    model_used: String::new(),
-                    tested_at: chrono::Utc::now().timestamp(),
-                    retry_count: 0,
-                    error_category: None,
-                });
+        let claude_api_format_override = resolve_claude_api_format_override(
+            &app_type,
+            &provider,
+            &config,
+            &copilot_state,
+            auth_override.as_ref(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            log::warn!(
+                "[StreamCheck] Failed to resolve Claude API format override for {}: {}",
+                provider.id,
+                e
+            );
+            None
+        });
+        let result = StreamCheckService::check_with_retry(
+            &app_type,
+            &provider,
+            &config,
+            auth_override,
+            base_url_override,
+            claude_api_format_override,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            let (http_status, message) = match &e {
+                crate::error::AppError::HttpStatus { status, .. } => (
+                    Some(*status),
+                    StreamCheckService::classify_http_status(*status).to_string(),
+                ),
+                _ => (None, e.to_string()),
+            };
+            StreamCheckResult {
+                status: HealthStatus::Failed,
+                success: false,
+                message,
+                response_time_ms: None,
+                http_status,
+                model_used: String::new(),
+                tested_at: chrono::Utc::now().timestamp(),
+                retry_count: 0,
+                error_category: None,
+            }
+        });
 
         let _ = state
             .db
@@ -151,6 +200,39 @@ async fn resolve_copilot_base_url_override(
     Ok(Some(endpoint))
 }
 
+async fn resolve_copilot_auth_override(
+    provider: &crate::provider::Provider,
+    copilot_state: &State<'_, CopilotAuthState>,
+) -> Result<Option<crate::proxy::providers::AuthInfo>, AppError> {
+    let is_copilot = is_copilot_provider(provider);
+
+    if !is_copilot {
+        return Ok(None);
+    }
+
+    let auth_manager = copilot_state.0.read().await;
+    let account_id = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.managed_account_id_for("github_copilot"));
+
+    let token = match account_id.as_deref() {
+        Some(id) => auth_manager
+            .get_valid_token_for_account(id)
+            .await
+            .map_err(|e| AppError::Message(format!("GitHub Copilot 认证失败: {e}")))?,
+        None => auth_manager
+            .get_valid_token()
+            .await
+            .map_err(|e| AppError::Message(format!("GitHub Copilot 认证失败: {e}")))?,
+    };
+
+    Ok(Some(crate::proxy::providers::AuthInfo::new(
+        token,
+        crate::proxy::providers::AuthStrategy::GitHubCopilot,
+    )))
+}
+
 fn is_copilot_provider(provider: &crate::provider::Provider) -> bool {
     provider
         .meta
@@ -163,6 +245,61 @@ fn is_copilot_provider(provider: &crate::provider::Provider) -> bool {
             .and_then(|value| value.as_str())
             .map(|url| url.contains("githubcopilot.com"))
             .unwrap_or(false)
+}
+
+async fn resolve_claude_api_format_override(
+    app_type: &AppType,
+    provider: &crate::provider::Provider,
+    config: &StreamCheckConfig,
+    copilot_state: &State<'_, CopilotAuthState>,
+    auth_override: Option<&crate::proxy::providers::AuthInfo>,
+    model_override: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    if *app_type != AppType::Claude {
+        return Ok(None);
+    }
+
+    let is_copilot = auth_override
+        .map(|auth| auth.strategy == crate::proxy::providers::AuthStrategy::GitHubCopilot)
+        .unwrap_or(false);
+    if !is_copilot {
+        return Ok(None);
+    }
+
+    let model_id = model_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            StreamCheckService::resolve_effective_test_model(app_type, provider, config)
+        });
+    let auth_manager = copilot_state.0.read().await;
+    let account_id = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.managed_account_id_for("github_copilot"));
+
+    let vendor_result = match account_id.as_deref() {
+        Some(id) => {
+            auth_manager
+                .get_model_vendor_for_account(id, &model_id)
+                .await
+        }
+        None => auth_manager.get_model_vendor(&model_id).await,
+    };
+
+    let api_format = match vendor_result {
+        Ok(Some(vendor)) if vendor.eq_ignore_ascii_case("openai") => "openai_responses",
+        Ok(Some(_)) | Ok(None) => "openai_chat",
+        Err(err) => {
+            log::warn!(
+                "[StreamCheck] Failed to resolve Copilot model vendor for {model_id}: {err}. Falling back to chat/completions"
+            );
+            "openai_chat"
+        }
+    };
+
+    Ok(Some(api_format.to_string()))
 }
 
 #[cfg(test)]

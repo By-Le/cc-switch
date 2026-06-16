@@ -10,6 +10,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
   SelectContent,
@@ -89,7 +90,7 @@ export function ProviderAdvancedConfig({
             <FlaskConical className="h-4 w-4 text-muted-foreground" />
             <span className="font-medium">
               {t("providerAdvanced.testConfig", {
-                defaultValue: "连通检测配置",
+                defaultValue: "模型测试配置",
               })}
             </span>
           </div>
@@ -134,10 +135,31 @@ export function ProviderAdvancedConfig({
             <p className="text-sm text-muted-foreground">
               {t("providerAdvanced.testConfigDesc", {
                 defaultValue:
-                  "为此供应商配置单独的连通检测参数（超时/阈值/重试），不启用时使用全局配置。",
+                  "为此供应商配置单独的模型测试参数，不启用时使用全局配置。",
               })}
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="test-model">
+                  {t("providerAdvanced.testModel", {
+                    defaultValue: "测试模型",
+                  })}
+                </Label>
+                <Input
+                  id="test-model"
+                  value={testConfig.testModel ?? ""}
+                  onChange={(e) =>
+                    onTestConfigChange({
+                      ...testConfig,
+                      testModel: e.target.value || undefined,
+                    })
+                  }
+                  placeholder={t("providerAdvanced.testModelPlaceholder", {
+                    defaultValue: "留空使用全局配置",
+                  })}
+                  disabled={!testConfig.enabled}
+                />
+              </div>
               <div className="space-y-2">
                 <Label htmlFor="test-timeout">
                   {t("providerAdvanced.timeoutSecs", {
@@ -148,7 +170,7 @@ export function ProviderAdvancedConfig({
                   id="test-timeout"
                   type="number"
                   min={1}
-                  max={60}
+                  max={120}
                   value={testConfig.timeoutSecs || ""}
                   onChange={(e) =>
                     onTestConfigChange({
@@ -158,7 +180,7 @@ export function ProviderAdvancedConfig({
                         : undefined,
                     })
                   }
-                  placeholder="8"
+                  placeholder="45"
                   disabled={!testConfig.enabled}
                 />
               </div>
@@ -210,6 +232,27 @@ export function ProviderAdvancedConfig({
                   disabled={!testConfig.enabled}
                 />
               </div>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="test-prompt">
+                {t("providerAdvanced.testPrompt", {
+                  defaultValue: "测试提示词",
+                })}
+              </Label>
+              <Textarea
+                id="test-prompt"
+                value={testConfig.testPrompt ?? ""}
+                onChange={(e) =>
+                  onTestConfigChange({
+                    ...testConfig,
+                    testPrompt: e.target.value || undefined,
+                  })
+                }
+                placeholder="Who are you?"
+                rows={2}
+                className="min-h-[60px]"
+                disabled={!testConfig.enabled}
+              />
             </div>
           </div>
         </div>

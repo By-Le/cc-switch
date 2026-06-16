@@ -2328,7 +2328,14 @@
   "modelTest": {
     "testProvider": "测试模型",
     "testing": "正在测试模型",
-    "unavailable": "当前供应商不支持模型测试"
+    "unavailable": "当前供应商不支持模型测试",
+    "dialogTitle": "选择测试模型",
+    "dialogDescription": "将发送一条真实流式模型请求。你可以临时指定本次要测试的模型，不会改写供应商配置。",
+    "suggestedModel": "当前建议模型：{{model}}",
+    "emptyModelHint": "留空时按当前供应商配置或全局默认测试模型执行。",
+    "dialogInputLabel": "测试模型",
+    "dialogInputPlaceholder": "留空使用当前配置/全局默认",
+    "confirmTest": "开始测试"
   },
   "health": {
     "operational": "正常",

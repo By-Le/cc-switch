@@ -2328,7 +2328,14 @@
   "modelTest": {
     "testProvider": "モデルテスト",
     "testing": "モデルをテスト中",
-    "unavailable": "このプロバイダーはモデルテストに対応していません"
+    "unavailable": "このプロバイダーはモデルテストに対応していません",
+    "dialogTitle": "テストモデルを選択",
+    "dialogDescription": "実際のストリーミングモデルリクエストを送信します。今回だけ使うモデルを一時的に指定できますが、プロバイダー設定は変更しません。",
+    "suggestedModel": "推奨モデル: {{model}}",
+    "emptyModelHint": "空欄の場合は現在のプロバイダー設定またはグローバル既定のテストモデルを使います。",
+    "dialogInputLabel": "テストモデル",
+    "dialogInputPlaceholder": "空欄で現在/グローバル既定を使用",
+    "confirmTest": "テスト開始"
   },
   "health": {
     "operational": "正常",

@@ -305,6 +305,12 @@ pub struct ProviderTestConfig {
     /// 最大重试次数
     #[serde(rename = "maxRetries", skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
+    /// 默认测试模型；为空时使用供应商当前模型或全局默认。
+    #[serde(rename = "testModel", skip_serializing_if = "Option::is_none")]
+    pub test_model: Option<String>,
+    /// 默认测试提示词；为空时使用全局默认。
+    #[serde(rename = "testPrompt", skip_serializing_if = "Option::is_none")]
+    pub test_prompt: Option<String>,
 }
 
 /// 认证绑定来源

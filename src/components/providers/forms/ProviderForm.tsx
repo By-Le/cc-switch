@@ -196,6 +196,30 @@ export const normalizeProviderLoadLimitsForSave = (
   };
 };
 
+export const normalizeProviderTestConfigForSave = (
+  config: ProviderTestConfig,
+): ProviderTestConfig | undefined => {
+  if (!config.enabled) {
+    return undefined;
+  }
+
+  const testModel = config.testModel?.trim();
+  const testPrompt = config.testPrompt?.trim();
+
+  return {
+    enabled: true,
+    ...(config.timeoutSecs !== undefined
+      ? { timeoutSecs: config.timeoutSecs }
+      : {}),
+    ...(config.degradedThresholdMs !== undefined
+      ? { degradedThresholdMs: config.degradedThresholdMs }
+      : {}),
+    ...(config.maxRetries !== undefined ? { maxRetries: config.maxRetries } : {}),
+    ...(testModel ? { testModel } : {}),
+    ...(testPrompt ? { testPrompt } : {}),
+  };
+};
+
 const normalizeCodexChatReasoningForSave = (
   value?: CodexChatReasoning,
 ): CodexChatReasoning | undefined => {
@@ -1437,7 +1461,7 @@ function ProviderFormFull({
         (appId === "claude" || appId === "codex") && category !== "official"
           ? customUserAgent.trim() || undefined
           : undefined,
-      testConfig: testConfig.enabled ? testConfig : undefined,
+      testConfig: normalizeProviderTestConfigForSave(testConfig),
       costMultiplier: pricingConfig.enabled
         ? pricingConfig.costMultiplier
         : undefined,

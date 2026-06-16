@@ -707,11 +707,9 @@ export function ProviderCard({
               onEdit={() => onEdit(provider)}
               onDuplicate={() => onDuplicate(provider)}
               onTest={
-                // 连通检测对第三方/自定义/Copilot/Codex-OAuth 供应商开放（这些正是旧的
-                // 真实请求探测会误报、而可达性探测能正确处理的对象）。官方供应商
-                // (category === "official") 一律隐藏：它们 base_url 故意留空、走客户端
-                // 默认/OAuth 端点，cc-switch 没有可靠的探测目标（尤其 Claude Desktop
-                // 官方是原生 1P 模式，根本不在请求路径上）。
+                // 真实模型测试只对非官方供应商开放。官方供应商 (category ===
+                // "official") 的 base_url 往往留空并依赖客户端内置/OAuth 端点，
+                // cc-switch 无法稳定构造可验证的独立测试请求。
                 onTest && provider.category !== "official"
                   ? () => onTest(provider)
                   : undefined

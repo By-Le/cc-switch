@@ -11,11 +11,9 @@ import type { AppId } from "@/lib/api";
 export type LastStreamCheckResult = ProviderStreamCheckResult;
 
 /**
- * 供应商连通性检查。
+ * 供应商真实模型测试。
  *
- * 只探测 base_url 是否可达（任何 HTTP 响应都算可达），不发真实大模型请求。
- * 刻意 **不** 重置故障转移熔断器——可达 ≠ 配置正确，一个端口通但鉴权废的供应商
- * 不应被误判为"健康"而切回线上。熔断器只由真实转发流量驱动（见 proxy/forwarder.rs）。
+ * 会发送真实流式模型请求，但不重置故障转移熔断器；熔断器只由实际代理流量驱动。
  */
 export function useStreamCheck(appId: AppId) {
   const { t } = useTranslation();
@@ -28,11 +26,16 @@ export function useStreamCheck(appId: AppId) {
     async (
       providerId: string,
       providerName: string,
+      modelOverride?: string,
     ): Promise<StreamCheckResult | null> => {
       setCheckingIds((prev) => new Set(prev).add(providerId));
 
       try {
-        const result = await streamCheckProvider(appId, providerId);
+        const result = await streamCheckProvider(
+          appId,
+          providerId,
+          modelOverride,
+        );
         setLastResults((prev) => ({
           ...prev,
           [providerId]: { ...result, providerId },
@@ -40,34 +43,70 @@ export function useStreamCheck(appId: AppId) {
 
         if (result.status === "operational") {
           toast.success(
-            t("streamCheck.reachable", {
+            t("streamCheck.operational", {
               providerName: providerName,
               responseTimeMs: result.responseTimeMs,
-              defaultValue: `${providerName} 连通正常 (${result.responseTimeMs}ms)`,
+              defaultValue: `${providerName} 运行正常 (${result.responseTimeMs}ms)`,
             }),
             { closeButton: true },
           );
         } else if (result.status === "degraded") {
           toast.warning(
-            t("streamCheck.reachableSlow", {
+            t("streamCheck.degraded", {
               providerName: providerName,
               responseTimeMs: result.responseTimeMs,
-              defaultValue: `${providerName} 连通但较慢 (${result.responseTimeMs}ms)`,
+              defaultValue: `${providerName} 响应较慢 (${result.responseTimeMs}ms)`,
             }),
           );
-        } else {
-          // 仅当无法建立连接（DNS / 连接被拒 / TLS / 超时）才会到这里
+        } else if (result.errorCategory === "modelNotFound") {
           toast.error(
-            t("streamCheck.unreachable", {
+            t("streamCheck.modelNotFound", {
               providerName: providerName,
-              message: result.message,
-              defaultValue: `${providerName} 无法连通: ${result.message}`,
+              model: result.modelUsed,
+              defaultValue: `${providerName} 测试模型 ${result.modelUsed} 不存在或已下架`,
             }),
             {
-              description: t("streamCheck.unreachableHint", {
-                defaultValue:
-                  "无法建立连接（DNS / 连接 / TLS / 超时）。请检查 base_url 与网络。",
+              description: t("streamCheck.modelNotFoundHint", {
+                defaultValue: "",
               }),
+              duration: 10000,
+              closeButton: true,
+            },
+          );
+        } else if (result.errorCategory === "quotaExceeded") {
+          toast.warning(
+            t("streamCheck.quotaExceeded", {
+              providerName: providerName,
+              defaultValue: `${providerName} Coding Plan quota has been exceeded`,
+            }),
+            {
+              description: t("streamCheck.quotaExceededHint", {
+                defaultValue: "",
+              }),
+              duration: 10000,
+              closeButton: true,
+            },
+          );
+        } else {
+          const httpStatus = result.httpStatus;
+          const hintKey = httpStatus
+            ? `streamCheck.httpHint.${httpStatus >= 500 ? "5xx" : httpStatus}`
+            : null;
+          const description =
+            (hintKey ? t(hintKey, { defaultValue: "" }) : "") || undefined;
+          const isProbeRejection =
+            httpStatus != null &&
+            ([401, 403, 400, 429].includes(httpStatus) || httpStatus >= 500);
+
+          const toastFn = isProbeRejection ? toast.warning : toast.error;
+          toastFn(
+            t(isProbeRejection ? "streamCheck.rejected" : "streamCheck.failed", {
+              providerName: providerName,
+              message: result.message,
+              defaultValue: `${providerName} 检查失败: ${result.message}`,
+            }),
+            {
+              description,
               duration: 8000,
               closeButton: true,
             },

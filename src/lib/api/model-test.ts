@@ -1,18 +1,26 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { AppId } from "./types";
 
-// ===== 连通性检查类型 =====
-// 注意：本检查只探测 base_url 是否可达，不发真实大模型请求，也不触碰故障转移熔断器。
+// ===== 模型测试类型 =====
+// 注意：本检查会发送真实流式模型请求，但不触碰故障转移熔断器。
 
 export type HealthStatus = "operational" | "degraded" | "failed";
 
 export interface StreamCheckConfig {
-  /** 单次探测超时（秒） */
+  /** 单次测试超时（秒） */
   timeoutSecs: number;
   /** 超时类失败的最大重试次数 */
   maxRetries: number;
-  /** 降级阈值（毫秒）：可达但 TTFB 超过该值判定为"较慢" */
+  /** 降级阈值（毫秒）：首字节响应超过该值判定为"较慢" */
   degradedThresholdMs: number;
+  /** Claude 默认测试模型 */
+  claudeModel: string;
+  /** Codex 默认测试模型 */
+  codexModel: string;
+  /** Gemini 默认测试模型 */
+  geminiModel: string;
+  /** 默认测试提示词 */
+  testPrompt: string;
 }
 
 export interface StreamCheckResult {
@@ -21,26 +29,33 @@ export interface StreamCheckResult {
   message: string;
   responseTimeMs?: number;
   httpStatus?: number;
-  /** 兼容历史日志/展示字段；连通性检查恒为空。 */
+  /** 本次测试实际使用的模型。 */
   modelUsed?: string;
   testedAt: number;
   retryCount: number;
+  /** 细粒度错误分类，如 modelNotFound / quotaExceeded。 */
+  errorCategory?: string;
 }
 
 export type ProviderStreamCheckResult = StreamCheckResult & {
   providerId: string;
 };
 
-// ===== 连通性检查 API =====
+// ===== 模型测试 API =====
 
 /**
- * 连通性检查（单个供应商）
+ * 模型测试（单个供应商）
  */
 export async function streamCheckProvider(
   appType: AppId,
   providerId: string,
+  modelOverride?: string,
 ): Promise<StreamCheckResult> {
-  return invoke("stream_check_provider", { appType, providerId });
+  return invoke("stream_check_provider", {
+    appType,
+    providerId,
+    modelOverride,
+  });
 }
 
 /**
@@ -54,14 +69,14 @@ export async function streamCheckAllProviders(
 }
 
 /**
- * 获取流式检查配置
+ * 获取模型测试配置
  */
 export async function getStreamCheckConfig(): Promise<StreamCheckConfig> {
   return invoke("get_stream_check_config");
 }
 
 /**
- * 保存流式检查配置
+ * 保存模型测试配置
  */
 export async function saveStreamCheckConfig(
   config: StreamCheckConfig,
