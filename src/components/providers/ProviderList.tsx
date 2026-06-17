@@ -14,12 +14,25 @@ import {
   type CSSProperties,
 } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, Check, Search, X } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Download,
+  Loader2,
+  Search,
+  X,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import type { Provider } from "@/types";
-import { extractCodexModelName } from "@/utils/providerConfigUtils";
+import {
+  extractCodexBaseUrl,
+  extractCodexExperimentalBearerToken,
+  extractCodexModelName,
+} from "@/utils/providerConfigUtils";
 import type { ActiveTarget } from "@/types/proxy";
 import type { AppId } from "@/lib/api";
 import {
@@ -54,8 +67,18 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { settingsApi } from "@/lib/api/settings";
+import {
+  fetchModelsForConfig,
+  showFetchModelsError,
+  type FetchedModel,
+} from "@/lib/api/model-fetch";
 import { cn } from "@/lib/utils";
 import {
   Dialog,
@@ -70,6 +93,13 @@ type TestModelOption = {
   value: string;
   label?: string;
 };
+
+interface ModelFetchParams {
+  baseUrl: string;
+  apiKey: string;
+  isFullUrl?: boolean;
+  customUserAgent?: string;
+}
 
 interface ProviderListProps {
   providers: Record<string, Provider>;
@@ -99,6 +129,95 @@ interface ModelTestDialogState {
   suggestedModel: string;
   modelInput: string;
   options: TestModelOption[];
+  isOptionsExpanded: boolean;
+  isFetchingModels: boolean;
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function addUniqueModelOption(
+  options: TestModelOption[],
+  seen: Set<string>,
+  value?: string,
+  label?: string,
+) {
+  const normalized = value?.trim();
+  if (!normalized || seen.has(normalized)) return;
+  seen.add(normalized);
+  options.push({ value: normalized, label: label?.trim() || undefined });
+}
+
+function mergeModelOptions(
+  baseOptions: TestModelOption[],
+  fetchedOptions: TestModelOption[],
+): TestModelOption[] {
+  const merged: TestModelOption[] = [];
+  const seen = new Set<string>();
+  for (const option of [...baseOptions, ...fetchedOptions]) {
+    addUniqueModelOption(merged, seen, option.value, option.label);
+  }
+  return merged;
+}
+
+function fetchedModelsToOptions(models: FetchedModel[]): TestModelOption[] {
+  const options: TestModelOption[] = [];
+  const seen = new Set<string>();
+  for (const model of models) {
+    addUniqueModelOption(options, seen, model.id);
+  }
+  return options;
+}
+
+function getModelFetchParams(
+  appId: AppId,
+  provider: Provider,
+): ModelFetchParams | null {
+  const config = provider.settingsConfig ?? {};
+  const env = config.env as Record<string, unknown> | undefined;
+
+  if (appId === "codex") {
+    const configText = stringValue(config.config);
+    const auth = config.auth as { OPENAI_API_KEY?: unknown } | undefined;
+    const apiKey =
+      stringValue(auth?.OPENAI_API_KEY) ||
+      stringValue(extractCodexExperimentalBearerToken(configText));
+    return {
+      baseUrl: stringValue(extractCodexBaseUrl(configText)),
+      apiKey,
+      isFullUrl: provider.meta?.isFullUrl,
+      customUserAgent: provider.meta?.customUserAgent,
+    };
+  }
+
+  if (appId === "claude" || appId === "claude-desktop") {
+    return {
+      baseUrl: stringValue(env?.ANTHROPIC_BASE_URL),
+      apiKey:
+        stringValue(env?.ANTHROPIC_AUTH_TOKEN) ||
+        stringValue(env?.ANTHROPIC_API_KEY),
+      isFullUrl: provider.meta?.isFullUrl,
+      customUserAgent: provider.meta?.customUserAgent,
+    };
+  }
+
+  if (appId === "gemini") {
+    return {
+      baseUrl: stringValue(env?.GOOGLE_GEMINI_BASE_URL),
+      apiKey:
+        stringValue(env?.GEMINI_API_KEY) || stringValue(env?.GOOGLE_API_KEY),
+    };
+  }
+
+  if (appId === "opencode" || appId === "openclaw" || appId === "hermes") {
+    return {
+      baseUrl: stringValue(config.baseUrl) || stringValue(config.base_url),
+      apiKey: stringValue(config.apiKey) || stringValue(config.api_key),
+    };
+  }
+
+  return null;
 }
 
 export function ProviderList({
@@ -243,6 +362,7 @@ export function ProviderList({
   } | null>(null);
   const [modelTestDialog, setModelTestDialog] =
     useState<ModelTestDialogState | null>(null);
+  const modelFetchRequestRef = useRef(0);
   const { data: claudeDesktopStatus } = useQuery({
     queryKey: ["claudeDesktopStatus"],
     queryFn: () => providersApi.getClaudeDesktopStatus(),
@@ -283,12 +403,16 @@ export function ProviderList({
       if (appId === "claude" || appId === "claude-desktop") {
         const env = config.env as Record<string, unknown> | undefined;
         const value = env?.ANTHROPIC_MODEL;
-        return typeof value === "string" ? value.trim() || undefined : undefined;
+        return typeof value === "string"
+          ? value.trim() || undefined
+          : undefined;
       }
       if (appId === "gemini") {
         const env = config.env as Record<string, unknown> | undefined;
         const value = env?.GEMINI_MODEL;
-        return typeof value === "string" ? value.trim() || undefined : undefined;
+        return typeof value === "string"
+          ? value.trim() || undefined
+          : undefined;
       }
       if (appId === "codex") {
         return extractCodexModelName(config.config);
@@ -300,7 +424,9 @@ export function ProviderList({
       if (appId === "openclaw") {
         const models = Array.isArray(config.models) ? config.models : [];
         const first = models[0] as { id?: unknown } | undefined;
-        return typeof first?.id === "string" ? first.id.trim() || undefined : undefined;
+        return typeof first?.id === "string"
+          ? first.id.trim() || undefined
+          : undefined;
       }
       if (appId === "hermes") {
         const model = config.model as { default?: unknown } | undefined;
@@ -310,7 +436,9 @@ export function ProviderList({
         }
         const models = Array.isArray(config.models) ? config.models : [];
         const first = models[0] as { id?: unknown } | undefined;
-        return typeof first?.id === "string" ? first.id.trim() || undefined : undefined;
+        return typeof first?.id === "string"
+          ? first.id.trim() || undefined
+          : undefined;
       }
       return undefined;
     },
@@ -344,7 +472,9 @@ export function ProviderList({
           );
         }
       } else if (appId === "opencode") {
-        const models = config.models as Record<string, { name?: string }> | undefined;
+        const models = config.models as
+          | Record<string, { name?: string }>
+          | undefined;
         if (models) {
           for (const [id, model] of Object.entries(models)) {
             pushOption(id, model?.name);
@@ -352,7 +482,11 @@ export function ProviderList({
         }
       } else if (appId === "openclaw" || appId === "hermes") {
         const models = Array.isArray(config.models) ? config.models : [];
-        for (const item of models as Array<{ id?: unknown; name?: unknown; alias?: unknown }>) {
+        for (const item of models as Array<{
+          id?: unknown;
+          name?: unknown;
+          alias?: unknown;
+        }>) {
           pushOption(
             typeof item.id === "string" ? item.id : undefined,
             typeof item.name === "string"
@@ -382,6 +516,8 @@ export function ProviderList({
         suggestedModel,
         modelInput: suggestedModel,
         options,
+        isOptionsExpanded: options.length > 0,
+        isFetchingModels: false,
       });
     },
     [getProviderTestModelOptions],
@@ -404,11 +540,10 @@ export function ProviderList({
     setShowStreamCheckConfirm(false);
 
     try {
-      if (settings) {
-        const { webdavSync: _, s3Sync: _s3Sync, ...rest } = settings;
-        await settingsApi.save({ ...rest, streamCheckConfirmed: true });
-        await queryClient.invalidateQueries({ queryKey: ["settings"] });
-      }
+      const currentSettings = settings ?? (await settingsApi.get());
+      const { webdavSync: _, s3Sync: _s3Sync, ...rest } = currentSettings;
+      await settingsApi.save({ ...rest, streamCheckConfirmed: true });
+      await queryClient.invalidateQueries({ queryKey: ["settings"] });
     } catch (error) {
       console.error("Failed to save stream check confirmed:", error);
     }
@@ -435,6 +570,92 @@ export function ProviderList({
       setModelTestDialog(null);
     }
   }, [checkProvider, modelTestDialog]);
+
+  const handleFetchTestModels = useCallback(() => {
+    if (!modelTestDialog) {
+      return;
+    }
+
+    const requestId = ++modelFetchRequestRef.current;
+    const providerId = modelTestDialog.provider.id;
+    const params = getModelFetchParams(appId, modelTestDialog.provider);
+    if (!params) {
+      showFetchModelsError(null, t, {
+        hasApiKey: false,
+        hasBaseUrl: false,
+      });
+      return;
+    }
+
+    if (!params.baseUrl || !params.apiKey) {
+      showFetchModelsError(null, t, {
+        hasApiKey: !!params.apiKey,
+        hasBaseUrl: !!params.baseUrl,
+      });
+      return;
+    }
+
+    setModelTestDialog((current) =>
+      current ? { ...current, isFetchingModels: true } : current,
+    );
+
+    fetchModelsForConfig(
+      params.baseUrl,
+      params.apiKey,
+      params.isFullUrl,
+      undefined,
+      params.customUserAgent,
+    )
+      .then((models) => {
+        const fetchedOptions = fetchedModelsToOptions(models);
+        if (modelFetchRequestRef.current !== requestId) {
+          return;
+        }
+        setModelTestDialog((current) => {
+          if (!current || current.provider.id !== providerId) return current;
+          const mergedOptions = mergeModelOptions(
+            current.options,
+            fetchedOptions,
+          );
+          const nextModelInput =
+            current.modelInput.trim() || fetchedOptions[0]?.value || "";
+          return {
+            ...current,
+            modelInput: nextModelInput,
+            options: mergedOptions,
+            isOptionsExpanded: mergedOptions.length > 0,
+          };
+        });
+
+        if (models.length === 0) {
+          toast.info(t("providerForm.fetchModelsEmpty"));
+        } else {
+          toast.success(
+            t("providerForm.fetchModelsSuccess", { count: models.length }),
+          );
+        }
+      })
+      .catch((err) => {
+        console.warn("[ModelFetch] Failed:", err);
+        showFetchModelsError(err, t);
+      })
+      .finally(() => {
+        if (modelFetchRequestRef.current !== requestId) {
+          return;
+        }
+        setModelTestDialog((current) =>
+          current && current.provider.id === providerId
+            ? { ...current, isFetchingModels: false }
+            : current,
+        );
+      });
+  }, [appId, modelTestDialog, t]);
+
+  const handleSelectTestModel = useCallback((model: string) => {
+    setModelTestDialog((current) =>
+      current ? { ...current, modelInput: model } : current,
+    );
+  }, []);
 
   const currentTestModelOptions = useMemo(
     () => modelTestDialog?.options ?? [],
@@ -918,57 +1139,127 @@ export function ProviderList({
           </DialogHeader>
 
           <div className="space-y-4 px-6 py-4">
-            <div className="space-y-2">
-              <div className="text-sm font-medium text-foreground">
-                {t("streamCheck.modelListLabel", {
-                  defaultValue: "模型列表",
-                })}
+            <Collapsible
+              open={modelTestDialog?.isOptionsExpanded ?? false}
+              onOpenChange={(open) =>
+                setModelTestDialog((current) =>
+                  current ? { ...current, isOptionsExpanded: open } : current,
+                )
+              }
+              className="overflow-hidden rounded-lg border border-border-default bg-muted/10"
+            >
+              <div className="flex items-center justify-between gap-2 px-3 py-2">
+                <CollapsibleTrigger asChild>
+                  <Button
+                    type="button"
+                    variant={null}
+                    size="sm"
+                    className="h-7 max-w-full justify-start gap-1 px-0 text-sm font-medium text-foreground hover:opacity-70"
+                  >
+                    {modelTestDialog?.isOptionsExpanded ? (
+                      <ChevronDown className="h-4 w-4 shrink-0" />
+                    ) : (
+                      <ChevronRight className="h-4 w-4 shrink-0" />
+                    )}
+                    <span className="truncate">
+                      {t("streamCheck.modelListLabel", {
+                        defaultValue: "模型列表",
+                      })}
+                    </span>
+                  </Button>
+                </CollapsibleTrigger>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleFetchTestModels}
+                  disabled={
+                    modelTestDialog
+                      ? isChecking(modelTestDialog.provider.id) ||
+                        modelTestDialog.isFetchingModels
+                      : true
+                  }
+                  className="h-7 gap-1"
+                >
+                  {modelTestDialog?.isFetchingModels ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Download className="h-3.5 w-3.5" />
+                  )}
+                  {t("providerForm.fetchModels", {
+                    defaultValue: "获取模型列表",
+                  })}
+                </Button>
               </div>
-              {currentTestModelOptions.length > 0 ? (
-                <div className="grid max-h-40 grid-cols-1 gap-2 overflow-y-auto pr-1 sm:grid-cols-2">
-                  {currentTestModelOptions.map((option) => {
-                    const active =
-                      modelTestDialog?.modelInput.trim() === option.value;
-                    return (
-                      <Button
-                        key={option.value}
-                        type="button"
-                        variant={active ? "default" : "outline"}
-                        className={cn(
-                          "h-auto justify-start px-3 py-2 text-left",
-                          active && "shadow-sm",
-                        )}
-                        onClick={() =>
-                          setModelTestDialog((current) =>
-                            current
-                              ? { ...current, modelInput: option.value }
-                              : current,
-                          )
-                        }
-                        disabled={
-                          modelTestDialog
-                            ? isChecking(modelTestDialog.provider.id)
-                            : false
-                        }
-                      >
-                        <span className="min-w-0 flex-1 break-all">
-                          {option.label ?? option.value}
-                        </span>
-                        {active ? (
-                          <Check className="h-4 w-4 shrink-0" />
-                        ) : null}
-                      </Button>
-                    );
-                  })}
-                </div>
-              ) : (
-                <p className="text-sm text-muted-foreground">
-                  {t("streamCheck.noModelAvailable", {
-                    defaultValue: "暂无",
-                  })}
-                </p>
-              )}
-            </div>
+              <CollapsibleContent>
+                {currentTestModelOptions.length > 0 ? (
+                  <div className="max-h-48 space-y-1 overflow-y-auto border-t border-border-default p-2">
+                    {currentTestModelOptions.map((option) => {
+                      const active =
+                        modelTestDialog?.modelInput.trim() === option.value;
+                      const label = option.label ?? option.value;
+                      const disabled = modelTestDialog
+                        ? isChecking(modelTestDialog.provider.id)
+                        : false;
+                      return (
+                        <div
+                          key={option.value}
+                          role="button"
+                          tabIndex={disabled ? -1 : 0}
+                          aria-label={label}
+                          aria-disabled={disabled}
+                          className={cn(
+                            "flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm transition-colors hover:bg-muted",
+                            active &&
+                              "bg-blue-50 text-blue-700 dark:bg-blue-950/40 dark:text-blue-300",
+                            disabled && "cursor-not-allowed opacity-50",
+                          )}
+                          onClick={() => {
+                            if (!disabled) handleSelectTestModel(option.value);
+                          }}
+                          onKeyDown={(event) => {
+                            if (
+                              disabled ||
+                              (event.key !== "Enter" && event.key !== " ")
+                            ) {
+                              return;
+                            }
+                            event.preventDefault();
+                            handleSelectTestModel(option.value);
+                          }}
+                        >
+                          <div
+                            aria-hidden="true"
+                            className={cn(
+                              "grid h-4 w-4 shrink-0 place-items-center rounded-sm border",
+                              active
+                                ? "border-blue-500 bg-blue-500 text-white"
+                                : "border-border bg-background",
+                            )}
+                          >
+                            {active ? <Check className="h-3 w-3" /> : null}
+                          </div>
+                          <span className="min-w-0 flex-1 break-all">
+                            {label}
+                          </span>
+                          {option.label && option.label !== option.value ? (
+                            <span className="max-w-[45%] truncate font-mono text-[11px] text-muted-foreground">
+                              {option.value}
+                            </span>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className="border-t border-border-default px-3 py-3 text-sm text-muted-foreground">
+                    {t("streamCheck.noModelAvailable", {
+                      defaultValue: "暂无",
+                    })}
+                  </p>
+                )}
+              </CollapsibleContent>
+            </Collapsible>
 
             <div className="space-y-2">
               <Label htmlFor="provider-model-test-input">
@@ -1004,7 +1295,9 @@ export function ProviderList({
               variant="outline"
               onClick={() => setModelTestDialog(null)}
               disabled={
-                modelTestDialog ? isChecking(modelTestDialog.provider.id) : false
+                modelTestDialog
+                  ? isChecking(modelTestDialog.provider.id)
+                  : false
               }
             >
               {t("common.cancel", { defaultValue: "取消" })}

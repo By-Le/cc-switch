@@ -12,6 +12,7 @@ const checkProviderMock = vi.fn();
 const settingsApiGetMock = vi.fn();
 const settingsApiSaveMock = vi.fn();
 const getStreamCheckConfigMock = vi.fn();
+const fetchModelsForConfigMock = vi.fn();
 let autoFailoverEnabled = false;
 let failoverQueue: Array<{ providerId: string; providerName: string }> = [];
 let lastStreamCheckResults: Record<string, unknown> = {};
@@ -113,6 +114,12 @@ vi.mock("@/lib/api/model-test", () => ({
     getStreamCheckConfigMock(...args),
 }));
 
+vi.mock("@/lib/api/model-fetch", () => ({
+  fetchModelsForConfig: (...args: unknown[]) =>
+    fetchModelsForConfigMock(...args),
+  showFetchModelsError: vi.fn(),
+}));
+
 vi.mock("@/components/UsageFooter", () => ({
   default: () => <div data-testid="usage-footer" />,
 }));
@@ -156,11 +163,17 @@ function createProvider(overrides: Partial<Provider> = {}): Provider {
   };
 }
 
-function renderWithQueryClient(ui: ReactElement) {
+function renderWithQueryClient(
+  ui: ReactElement,
+  options: { seedSettings?: boolean } = {},
+) {
+  const { seedSettings = true } = options;
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  queryClient.setQueryData(["settings"], { streamCheckConfirmed: true });
+  if (seedSettings) {
+    queryClient.setQueryData(["settings"], { streamCheckConfirmed: true });
+  }
   queryClient.setQueryData(["streamCheckConfig"], defaultStreamCheckConfig);
 
   return render(
@@ -176,6 +189,7 @@ beforeEach(() => {
   settingsApiGetMock.mockReset();
   settingsApiSaveMock.mockReset();
   getStreamCheckConfigMock.mockReset();
+  fetchModelsForConfigMock.mockReset();
 
   useSortableMock.mockImplementation(({ id }: { id: string }) => ({
     setNodeRef: vi.fn(),
@@ -197,6 +211,7 @@ beforeEach(() => {
   settingsApiGetMock.mockResolvedValue({ streamCheckConfirmed: true });
   settingsApiSaveMock.mockResolvedValue(true);
   getStreamCheckConfigMock.mockResolvedValue(defaultStreamCheckConfig);
+  fetchModelsForConfigMock.mockResolvedValue([]);
 });
 
 describe("ProviderList Component", () => {
@@ -562,9 +577,7 @@ describe("ProviderList Component", () => {
     expect(screen.getByText("DeepSeek V4 Flash")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "DeepSeek V4 Flash" }));
-    expect(
-      screen.getByDisplayValue("deepseek-v4-flash"),
-    ).toBeInTheDocument();
+    expect(screen.getByDisplayValue("deepseek-v4-flash")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "开始测试" }));
 
@@ -572,6 +585,71 @@ describe("ProviderList Component", () => {
       "codex-a",
       "Codex A",
       "deepseek-v4-flash",
+    );
+  });
+
+  it("fetches test model list and fills input from the selected model", async () => {
+    fetchModelsForConfigMock.mockResolvedValue([
+      { id: "model-from-fetch-a", ownedBy: "vendor-a" },
+      { id: "model-from-fetch-b", ownedBy: "vendor-a" },
+    ]);
+
+    const provider = createProvider({
+      id: "codex-fetch",
+      name: "Codex Fetch",
+      meta: { isFullUrl: true, customUserAgent: "Custom UA" },
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "sk-test" },
+        config: `
+model = ""
+base_url = "https://api.example.com/v1"
+`,
+      },
+    });
+
+    useDragSortMock.mockReturnValue({
+      sortedProviders: [provider],
+      sensors: [],
+      handleDragEnd: vi.fn(),
+    });
+
+    renderWithQueryClient(
+      <ProviderList
+        providers={{ "codex-fetch": provider }}
+        currentProviderId=""
+        appId="codex"
+        onSwitch={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onDuplicate={vi.fn()}
+        onOpenWebsite={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("test-codex-fetch"));
+    await screen.findByText("选择测试模型");
+
+    fireEvent.click(screen.getByRole("button", { name: "获取模型列表" }));
+
+    expect(fetchModelsForConfigMock).toHaveBeenCalledWith(
+      "https://api.example.com/v1",
+      "sk-test",
+      true,
+      undefined,
+      "Custom UA",
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "model-from-fetch-b" }),
+    );
+    expect(screen.getByDisplayValue("model-from-fetch-b")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "开始测试" }));
+
+    expect(checkProviderMock).toHaveBeenCalledWith(
+      "codex-fetch",
+      "Codex Fetch",
+      "model-from-fetch-b",
     );
   });
 
@@ -615,5 +693,55 @@ describe("ProviderList Component", () => {
       "Codex B",
       "manual-model-x",
     );
+  });
+
+  it("persists stream check confirmation even when settings query is not warm", async () => {
+    const provider = createProvider({
+      id: "codex-c",
+      name: "Codex C",
+      settingsConfig: {
+        config: 'model = "runtime-model"',
+      },
+    });
+
+    settingsApiGetMock.mockResolvedValue({
+      showInTray: true,
+      minimizeToTrayOnClose: true,
+      language: "zh",
+      streamCheckConfirmed: false,
+      webdavSync: { password: "" },
+      s3Sync: { secretAccessKey: "" },
+    });
+    useDragSortMock.mockReturnValue({
+      sortedProviders: [provider],
+      sensors: [],
+      handleDragEnd: vi.fn(),
+    });
+
+    renderWithQueryClient(
+      <ProviderList
+        providers={{ "codex-c": provider }}
+        currentProviderId=""
+        appId="codex"
+        onSwitch={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onDuplicate={vi.fn()}
+        onOpenWebsite={vi.fn()}
+      />,
+      { seedSettings: false },
+    );
+
+    fireEvent.click(screen.getByTestId("test-codex-c"));
+    fireEvent.click(await screen.findByText("confirm.streamCheck.confirm"));
+
+    expect(await screen.findByText("选择测试模型")).toBeInTheDocument();
+    expect(settingsApiSaveMock).toHaveBeenCalledWith(
+      expect.objectContaining({ streamCheckConfirmed: true }),
+    );
+    expect(settingsApiSaveMock.mock.calls[0][0]).not.toHaveProperty(
+      "webdavSync",
+    );
+    expect(settingsApiSaveMock.mock.calls[0][0]).not.toHaveProperty("s3Sync");
   });
 });
