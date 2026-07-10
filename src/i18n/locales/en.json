@@ -2378,6 +2378,7 @@
       "title": "Batch Import MCP Servers",
       "targetApps": "Target Apps",
       "serverCount": "MCP Servers ({{count}})",
+      "invalidServerSpec": "Invalid server configuration",
       "enabledWarning": "After import, configurations will be written to all specified apps immediately"
     },
     "prompt": {

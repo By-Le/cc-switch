@@ -195,4 +195,30 @@ describe("ClaudeFormFields", () => {
       "shared-model[1M]",
     );
   });
+
+  it("获取普通模型列表时会用归一化后的 baseUrl 命中预设 modelsUrl", async () => {
+    renderCopilotForm({
+      isCopilotPreset: false,
+      usesOAuth: false,
+      isCopilotAuthenticated: false,
+      baseUrl: " https://api.deepseek.com/anthropic/ ",
+      apiKey: "sk-test",
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "providerForm.fetchModels",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(modelFetchApiMock.fetchModelsForConfig).toHaveBeenCalledWith(
+        " https://api.deepseek.com/anthropic/ ",
+        "sk-test",
+        false,
+        "https://api.deepseek.com/models",
+        "",
+      );
+    });
+  });
 });

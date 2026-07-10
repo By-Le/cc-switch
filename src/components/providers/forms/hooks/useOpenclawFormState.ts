@@ -2,7 +2,10 @@ import { useState, useCallback, useMemo } from "react";
 import type { OpenClawModel, OpenClawProviderConfig } from "@/types";
 import type { AppId } from "@/lib/api";
 import { useProvidersQuery } from "@/lib/query/queries";
-import { OPENCLAW_DEFAULT_CONFIG } from "../helpers/opencodeFormUtils";
+import {
+  OPENCLAW_DEFAULT_CONFIG,
+  parseConfigRecordWithFallback,
+} from "../helpers/opencodeFormUtils";
 
 interface UseOpenclawFormStateParams {
   initialData?: {
@@ -104,15 +107,13 @@ export function useOpenclawFormState({
 
   const updateOpenclawConfig = useCallback(
     (updater: (config: Record<string, any>) => void) => {
-      try {
-        const config = JSON.parse(
-          getSettingsConfig() || OPENCLAW_DEFAULT_CONFIG,
-        );
-        updater(config);
-        onSettingsConfigChange(JSON.stringify(config, null, 2));
-      } catch {
-        // ignore
-      }
+      const config = parseConfigRecordWithFallback(
+        getSettingsConfig(),
+        OPENCLAW_DEFAULT_CONFIG,
+      );
+
+      updater(config);
+      onSettingsConfigChange(JSON.stringify(config, null, 2));
     },
     [getSettingsConfig, onSettingsConfigChange],
   );

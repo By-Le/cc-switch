@@ -2378,6 +2378,7 @@
       "title": "批量导入 MCP Servers",
       "targetApps": "目标应用",
       "serverCount": "MCP Servers ({{count}} 个)",
+      "invalidServerSpec": "无效的服务器配置",
       "enabledWarning": "导入后将立即写入所有指定应用的配置文件"
     },
     "prompt": {

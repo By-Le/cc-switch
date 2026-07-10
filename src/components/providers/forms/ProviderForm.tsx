@@ -116,6 +116,7 @@ import {
   OPENCODE_DEFAULT_CONFIG,
   OPENCLAW_DEFAULT_CONFIG,
   normalizePricingSource,
+  parseConfigRecordWithFallback,
 } from "./helpers/opencodeFormUtils";
 import { HERMES_DEFAULT_CONFIG } from "./hooks/useHermesFormState";
 import { resolveManagedAccountId } from "@/lib/authBinding";
@@ -815,16 +816,20 @@ function ProviderFormFull({
       key: "GEMINI_API_KEY" | "GOOGLE_GEMINI_BASE_URL" | "GEMINI_MODEL",
       value: string,
     ) => {
-      try {
-        const config = JSON.parse(form.getValues("settingsConfig") || "{}") as {
-          env?: Record<string, unknown>;
-        };
-        if (!config.env || typeof config.env !== "object") {
-          config.env = {};
-        }
-        config.env[key] = value;
-        form.setValue("settingsConfig", JSON.stringify(config, null, 2));
-      } catch {}
+      const config = parseConfigRecordWithFallback(
+        form.getValues("settingsConfig"),
+        GEMINI_DEFAULT_CONFIG,
+      );
+
+      if (
+        !config.env ||
+        typeof config.env !== "object" ||
+        Array.isArray(config.env)
+      ) {
+        config.env = {};
+      }
+      config.env[key] = value;
+      form.setValue("settingsConfig", JSON.stringify(config, null, 2));
     },
     [form],
   );

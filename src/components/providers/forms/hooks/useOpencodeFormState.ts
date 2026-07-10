@@ -4,6 +4,7 @@ import {
   OPENCODE_DEFAULT_NPM,
   OPENCODE_DEFAULT_CONFIG,
   isKnownOpencodeOptionKey,
+  parseConfigRecordWithFallback,
   parseOpencodeConfig,
   toOpencodeExtraOptions,
 } from "../helpers/opencodeFormUtils";
@@ -32,6 +33,17 @@ export interface OpencodeFormState {
   handleOpencodeModelsChange: (models: Record<string, OpenCodeModel>) => void;
   handleOpencodeExtraOptionsChange: (options: Record<string, string>) => void;
   resetOpencodeState: (config?: OpenCodeProviderConfig) => void;
+}
+
+function getOptions(config: Record<string, any>): Record<string, any> {
+  if (
+    !config.options ||
+    typeof config.options !== "object" ||
+    Array.isArray(config.options)
+  ) {
+    config.options = {};
+  }
+  return config.options;
 }
 
 export function useOpencodeFormState({
@@ -85,13 +97,13 @@ export function useOpencodeFormState({
 
   const updateOpencodeSettings = useCallback(
     (updater: (config: Record<string, any>) => void) => {
-      try {
-        const config = JSON.parse(
-          getSettingsConfig() || OPENCODE_DEFAULT_CONFIG,
-        ) as Record<string, any>;
-        updater(config);
-        onSettingsConfigChange(JSON.stringify(config, null, 2));
-      } catch {}
+      const config = parseConfigRecordWithFallback(
+        getSettingsConfig(),
+        OPENCODE_DEFAULT_CONFIG,
+      );
+
+      updater(config);
+      onSettingsConfigChange(JSON.stringify(config, null, 2));
     },
     [getSettingsConfig, onSettingsConfigChange],
   );
@@ -110,8 +122,7 @@ export function useOpencodeFormState({
     (apiKey: string) => {
       setOpencodeApiKey(apiKey);
       updateOpencodeSettings((config) => {
-        if (!config.options) config.options = {};
-        config.options.apiKey = apiKey;
+        getOptions(config).apiKey = apiKey;
       });
     },
     [updateOpencodeSettings],
@@ -121,8 +132,7 @@ export function useOpencodeFormState({
     (baseUrl: string) => {
       setOpencodeBaseUrl(baseUrl);
       updateOpencodeSettings((config) => {
-        if (!config.options) config.options = {};
-        config.options.baseURL = baseUrl.trim().replace(/\/+$/, "");
+        getOptions(config).baseURL = baseUrl.trim().replace(/\/+$/, "");
       });
     },
     [updateOpencodeSettings],
@@ -142,11 +152,11 @@ export function useOpencodeFormState({
     (options: Record<string, string>) => {
       setOpencodeExtraOptions(options);
       updateOpencodeSettings((config) => {
-        if (!config.options) config.options = {};
+        const currentOptions = getOptions(config);
 
-        for (const k of Object.keys(config.options)) {
+        for (const k of Object.keys(currentOptions)) {
           if (!isKnownOpencodeOptionKey(k)) {
-            delete config.options[k];
+            delete currentOptions[k];
           }
         }
 
@@ -154,9 +164,9 @@ export function useOpencodeFormState({
           const trimmedKey = k.trim();
           if (trimmedKey && !trimmedKey.startsWith("option-")) {
             try {
-              config.options[trimmedKey] = JSON.parse(v);
+              currentOptions[trimmedKey] = JSON.parse(v);
             } catch {
-              config.options[trimmedKey] = v;
+              currentOptions[trimmedKey] = v;
             }
           }
         }

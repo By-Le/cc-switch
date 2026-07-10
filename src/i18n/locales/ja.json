@@ -2378,6 +2378,7 @@
       "title": "MCP サーバーを一括インポート",
       "targetApps": "ターゲットアプリ",
       "serverCount": "MCP サーバー（{{count}} 件）",
+      "invalidServerSpec": "無効なサーバー設定",
       "enabledWarning": "インポート後、指定したすべてのアプリに即座に書き込まれます"
     },
     "prompt": {

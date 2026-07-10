@@ -62,6 +62,29 @@ export const OPENCLAW_DEFAULT_CONFIG = JSON.stringify(
   2,
 );
 
+export function parseConfigRecordWithFallback(
+  value: string,
+  fallback: string,
+): Record<string, any> {
+  const parseRecord = (raw: string): Record<string, any> | null => {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "object" &&
+      parsed !== null &&
+      !Array.isArray(parsed)
+      ? (parsed as Record<string, any>)
+      : null;
+  };
+
+  try {
+    const parsed = parseRecord(value || fallback);
+    if (parsed) return parsed;
+  } catch {
+    // Fall through to the known-good default.
+  }
+
+  return parseRecord(fallback) ?? {};
+}
+
 // ── Pure functions ───────────────────────────────────────────────────
 
 export function isKnownOpencodeOptionKey(key: string): boolean {
